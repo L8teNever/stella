@@ -1,0 +1,24 @@
+services:
+  stella:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.example
+        required: false
+    environment:
+      STELLA_DB_PATH: /data/stella.db
+      XAI_OAUTH_TOKEN_PATH: /data/xai_oauth.json
+    volumes:
+      - stella-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  stella-data:

@@ -265,22 +265,29 @@ async def start_voice_bridge(
     outcome_cb,
     provider_cb: Callable[[str], None] | None = None,
     gemini_connect=None,
+    locked_provider: str | None = None,
 ) -> str:
-    """Open Grok Voice first; on session connect failure, fall back to Gemini Live.
+    """Run the already-chosen voice provider for this job.
 
-    Returns the provider name that actually connected (`grok` or `gemini`).
+    ``locked_provider`` is the sticky choice from MCP (`grok` or `gemini`).
+    Connect and media pumps use only that provider. A mid-session Grok drop
+    does **not** open Gemini (and vice versa). If unset, falls back to the
+    job's stored ``voice_provider``.
     """
     from stella.gemini_voice import GeminiVoiceSession
 
-    grok_error: Exception | None = None
-    token: str | None = None
-    try:
-        token = grok_token_fn()
-    except Exception as exc:
-        grok_error = exc
-        logger.warning("Grok credentials unavailable (%s); will try Gemini if configured", exc)
+    provider = (locked_provider or job.voice_provider or "").strip().lower()
+    if provider not in {"grok", "gemini"}:
+        raise RuntimeError(
+            "Voice provider was not selected for this call. "
+            "MCP place_call must choose grok or gemini before media starts."
+        )
 
-    if token:
+    if provider_cb:
+        provider_cb(provider)
+
+    if provider == "grok":
+        token = grok_token_fn()
         session = VoiceSession(
             settings=settings,
             job=job,
@@ -291,25 +298,14 @@ async def start_voice_bridge(
             outcome_cb=outcome_cb,
         )
         session._telnyx_ws = telnyx_ws
-        try:
-            await session.connect()
-            if provider_cb:
-                provider_cb("grok")
-            await session.run()
-            return "grok"
-        except Exception as exc:
-            grok_error = exc
-            logger.warning("Grok Voice session failed (%s); trying Gemini Live fallback", exc)
-            try:
-                await session.close()
-            except Exception:
-                pass
+        await session.connect()
+        await session.run()
+        return "grok"
 
     gemini_key = (settings.gemini_api_key or "").strip()
     if not gemini_key:
-        grok_msg = str(grok_error) if grok_error else "Grok Voice was not used"
         raise RuntimeError(
-            f"{grok_msg}. Gemini Live fallback is not available because GEMINI_API_KEY is not set."
+            "This call is locked to Gemini Live but GEMINI_API_KEY is not set."
         )
 
     gem = GeminiVoiceSession(
@@ -321,14 +317,6 @@ async def start_voice_bridge(
         outcome_cb=outcome_cb,
     )
     gem._telnyx_ws = telnyx_ws
-    try:
-        await gem.connect()
-        if provider_cb:
-            provider_cb("gemini")
-        await gem.run()
-        return "gemini"
-    except Exception as gem_err:
-        grok_msg = str(grok_error) if grok_error else "Grok Voice was not attempted"
-        raise RuntimeError(
-            f"Both voice providers failed. Grok: {grok_msg}. Gemini: {gem_err}"
-        ) from gem_err
+    await gem.connect()
+    await gem.run()
+    return "gemini"

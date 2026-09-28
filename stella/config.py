@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     # Official Gemini Live native-audio id (BidiGenerateContent). Override with GEMINI_LIVE_MODEL.
+    # Do not default to gemini-3.8-live-extended-thinking (phone latency).
     gemini_live_model: str = "gemini-3.8-live"
     gemini_voice: str = "Aoede"
     gemini_realtime_url: str = (

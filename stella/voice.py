@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any, Callable
@@ -9,6 +10,99 @@ from stella.config import Settings
 from stella.store import CallJob
 
 logger = logging.getLogger(__name__)
+
+# Telnyx RTP: 20 ms per 160-byte PCMU frame. Hang up only after the stream is
+# live and queued outbound audio has had time to play — otherwise Gemini/Grok
+# can complete (and call hang_up) during setup/ringing with 0 packets out.
+TELNYX_PCMU_FRAME_MS = 20
+TELNYX_PCMU_FRAME_BYTES = 160
+HANGUP_WAIT_AUDIO_S = 8.0
+HANGUP_PLAYOUT_PAD_S = 0.35
+HANGUP_PLAYOUT_CAP_S = 12.0
+
+
+def pcmu_payload_duration_ms(payload_b64: str) -> int:
+    try:
+        n = len(base64.b64decode(payload_b64, validate=False))
+    except Exception:
+        return TELNYX_PCMU_FRAME_MS
+    if n <= 0:
+        return TELNYX_PCMU_FRAME_MS
+    frames = max(1, n // TELNYX_PCMU_FRAME_BYTES)
+    return frames * TELNYX_PCMU_FRAME_MS
+
+
+class TelnyxMediaGuard:
+    """Hold kickoff until Telnyx `start`/`media`; delay hangup until audio playout."""
+
+    def __init__(
+        self,
+        *,
+        hangup_wait_audio_s: float = HANGUP_WAIT_AUDIO_S,
+        hangup_playout_pad_s: float = HANGUP_PLAYOUT_PAD_S,
+        sleep: Callable[[float], Any] | None = None,
+    ) -> None:
+        self.telnyx_started = asyncio.Event()
+        self.kickoff_sent = False
+        self.outbound_ms = 0
+        self.hangup_wait_audio_s = hangup_wait_audio_s
+        self.hangup_playout_pad_s = hangup_playout_pad_s
+        self._kickoff_lock = asyncio.Lock()
+        self._sleep = sleep or asyncio.sleep
+        self._hangup_task: asyncio.Task | None = None
+
+    def arm_hangup(self, deferred) -> asyncio.Task:
+        if self._hangup_task is None or self._hangup_task.done():
+            self._hangup_task = asyncio.create_task(deferred())
+        return self._hangup_task
+
+    def mark_started(self) -> None:
+        self.telnyx_started.set()
+
+    async def send_outbound_pcmu(self, telnyx_ws, payload: str) -> bool:
+        """Send one Telnyx media event if the RTP stream has started. Drops early audio."""
+        if not telnyx_ws or not payload:
+            return False
+        if not self.telnyx_started.is_set():
+            logger.info("Dropping outbound PCMU until Telnyx stream start")
+            return False
+        await telnyx_ws.send_text(json.dumps({"event": "media", "media": {"payload": payload}}))
+        self.outbound_ms += pcmu_payload_duration_ms(payload)
+        return True
+
+    async def kickoff_once(self, closed: Callable[[], bool], send_kickoff) -> None:
+        async with self._kickoff_lock:
+            if self.kickoff_sent or closed():
+                return
+            await self.telnyx_started.wait()
+            if closed() or self.kickoff_sent:
+                return
+            await send_kickoff()
+            self.kickoff_sent = True
+
+    async def hangup_after_audio(self, hangup_cb, closed: Callable[[], bool]) -> None:
+        """Wait for stream start + outbound audio (or timeout), then playout delay."""
+        await self.telnyx_started.wait()
+        deadline = asyncio.get_running_loop().time() + self.hangup_wait_audio_s
+        while self.outbound_ms <= 0 and not closed():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                logger.warning(
+                    "hang_up with no outbound PCMU after stream start; hanging up anyway"
+                )
+                break
+            await self._sleep(min(0.05, remaining))
+        if self.outbound_ms > 0:
+            wait_s = min(
+                self.outbound_ms / 1000.0 + self.hangup_playout_pad_s,
+                HANGUP_PLAYOUT_CAP_S,
+            )
+            await self._sleep(wait_s)
+        if closed():
+            return
+        result = hangup_cb()
+        if asyncio.iscoroutine(result):
+            await result
 
 
 STELLA_SYSTEM = """You are Stella, a phone agent placing a live outbound call.
@@ -87,6 +181,7 @@ class VoiceSession:
         self._closed = False
         self._assistant_bits: list[str] = []
         self.provider = "grok"
+        self.guard = TelnyxMediaGuard()
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -120,6 +215,11 @@ class VoiceSession:
                 }
             )
         )
+        # Kickoff waits for Telnyx stream start so the model does not "complete"
+        # (and hang_up) during ringing before any RTP can flow.
+
+    async def _send_kickoff(self) -> None:
+        assert self._grok_ws is not None
         await self._grok_ws.send(
             json.dumps(
                 {
@@ -140,7 +240,11 @@ class VoiceSession:
         await self._grok_ws.send(json.dumps({"type": "response.create"}))
 
     async def run(self) -> None:
-        await asyncio.gather(self._pump_telnyx(), self._pump_grok())
+        await asyncio.gather(
+            self._pump_telnyx(),
+            self._pump_grok(),
+            self.guard.kickoff_once(lambda: self._closed, self._send_kickoff),
+        )
 
     async def _pump_telnyx(self) -> None:
         assert self._telnyx_ws is not None
@@ -153,6 +257,8 @@ class VoiceSession:
                 except json.JSONDecodeError:
                     continue
                 event = msg.get("event")
+                if event in {"start", "media"}:
+                    self.guard.mark_started()
                 if event == "media":
                     media = msg.get("media") or {}
                     track = (media.get("track") or "").lower()
@@ -193,10 +299,8 @@ class VoiceSession:
         etype = event.get("type") or ""
         if etype == "response.output_audio.delta":
             delta = event.get("delta")
-            if delta and self._telnyx_ws:
-                await self._telnyx_ws.send_text(
-                    json.dumps({"event": "media", "media": {"payload": delta}})
-                )
+            if delta:
+                await self.guard.send_outbound_pcmu(self._telnyx_ws, delta)
         elif etype in {"response.output_text.delta", "response.audio_transcript.delta"}:
             piece = event.get("delta") or ""
             if piece:
@@ -228,10 +332,15 @@ class VoiceSession:
                             }
                         )
                     )
-                await self._hangup()
-                await self.close()
+                self.guard.arm_hangup(self._deferred_hangup)
         elif etype == "error":
             logger.error("Grok Voice error: %s", event)
+
+    async def _deferred_hangup(self) -> None:
+        try:
+            await self.guard.hangup_after_audio(self._hangup, lambda: self._closed)
+        finally:
+            await self.close()
 
     async def _send_telnyx_clear(self) -> None:
         if self._telnyx_ws:
@@ -244,6 +353,7 @@ class VoiceSession:
         if self._closed:
             return
         self._closed = True
+        self.guard.mark_started()
         for ws in (self._grok_ws,):
             if ws is None:
                 continue

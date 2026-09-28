@@ -28,6 +28,7 @@ class CallJob:
     outcome: str
     transcript: str
     error: str
+    voice_provider: str
     created_at: str
     updated_at: str
 
@@ -44,6 +45,7 @@ class CallJob:
             "outcome": self.outcome or None,
             "transcript": self.transcript or None,
             "error": self.error or None,
+            "voice_provider": self.voice_provider or None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -78,11 +80,18 @@ class JobStore:
                     outcome TEXT NOT NULL DEFAULT '',
                     transcript TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
+                    voice_provider TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            try:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN voice_provider TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -118,6 +127,7 @@ class JobStore:
             outcome="",
             transcript="",
             error="",
+            voice_provider="",
             created_at=_now(),
             updated_at=_now(),
         )
@@ -127,8 +137,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, kind, to_number, brief, context, speak_to, status,
                     telnyx_call_control_id, telnyx_call_leg_id, outcome,
-                    transcript, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript, error, voice_provider, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -143,6 +153,7 @@ class JobStore:
                     job.outcome,
                     job.transcript,
                     job.error,
+                    job.voice_provider,
                     job.created_at,
                     job.updated_at,
                 ),
@@ -222,6 +233,7 @@ class JobStore:
             outcome=row["outcome"],
             transcript=row["transcript"],
             error=row["error"],
+            voice_provider=row["voice_provider"] if "voice_provider" in row.keys() else "",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

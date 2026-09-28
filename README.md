@@ -1,12 +1,13 @@
 # Stella
 
-Independent **voice / phone** stack. Ida (or Grok Bot) dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Grok Voice**. Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. There is no mid-call roundtrip to Ida.
+Independent **voice / phone** stack. Ida (or Grok Bot) dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Grok Voice** (primary). If Grok realtime fails, Stella falls back to **Gemini Live** using `GEMINI_API_KEY`. Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. There is no mid-call roundtrip to Ida.
 
 ```
 Ida / Cursor  --MCP-->  Stella HTTP
                             |  POST /v2/calls (Telnyx dial + stream_url)
                             |  webhooks /webhooks/telnyx  → SQLite status
-                            |  WS /media/{job_id}  <-->  wss://api.x.ai/v1/realtime
+                            |  WS /media/{job_id}  <-->  Grok realtime (primary)
+                            |                       or Gemini Live (fallback)
 ```
 
 ## Run (Docker)
@@ -14,6 +15,7 @@ Ida / Cursor  --MCP-->  Stella HTTP
 ```bash
 cp .env.example .env
 # fill Telnyx + XAI_API_KEY (or complete OAuth after the container is up)
+# optional: GEMINI_API_KEY so a Grok realtime 403 can fall back to Gemini Live
 docker compose up --build
 ```
 
@@ -39,7 +41,8 @@ See `.env.example`. Required for a real outbound call:
 | `TELNYX_FROM_NUMBER` | E.164 caller ID |
 | `TELNYX_PUBLIC_KEY` | Ed25519 public key to verify webhooks |
 | `STELLA_PUBLIC_BASE_URL` | Public HTTPS origin Telnyx can hit |
-| `XAI_API_KEY` **or** SuperGrok OAuth tokens | Grok Voice |
+| `XAI_API_KEY` **or** SuperGrok OAuth tokens | Grok Voice (primary) |
+| `GEMINI_API_KEY` | Gemini Live fallback when Grok session connect fails |
 
 Optional: `STELLA_CALLBACK_URL` (POST JSON when a call hangs up), `STELLA_MCP_TOKEN` (Bearer for `/mcp`).
 
@@ -69,6 +72,16 @@ If both OAuth tokens and `XAI_API_KEY` exist, **OAuth wins** (subscription quota
 
 Voice model default: `grok-voice-latest` (`XAI_VOICE_MODEL`). Voice: `XAI_VOICE=eve`.
 
+## Gemini Live fallback
+
+Grok remains the primary realtime path. On **session connect** failure (HTTP 403, auth, rate/limit, websocket errors, missing Grok credentials), Stella opens Gemini Live (`BidiGenerateContent`) for that call instead. MCP tools (`stella_call`, etc.) are unchanged.
+
+Telnyx streams **PCMU 8 kHz**. Gemini Live wants **PCM 16-bit / 16 kHz in** and typically **24 kHz PCM out**, so Stella resamples and μ-law-encodes on the bridge. That conversion adds latency and can degrade audio versus Grok’s native PCMU path. `GET /health` reports `voice_provider.primary/fallback` and whether `GEMINI_API_KEY` is set. After a media session connects, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
+
+If Grok fails and `GEMINI_API_KEY` is empty, the job fails with an explicit error. If both providers fail, the error includes both reasons.
+
+Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Puck`).
+
 ## Telnyx
 
 1. Create a Call Control application / Voice API connection.
@@ -76,7 +89,7 @@ Voice model default: `grok-voice-latest` (`XAI_VOICE_MODEL`). Voice: `XAI_VOICE=
 3. Copy API key, connection id, and webhook public key.
 4. Point the connection’s webhook at `{STELLA_PUBLIC_BASE_URL}/webhooks/telnyx` (Stella also sends `webhook_url` on each dial).
 
-Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to Grok Voice. Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
+Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to Grok Voice (or Gemini Live after a Grok connect failure). Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
 
 ## MCP (Ida / Cursor / Grok Bot)
 

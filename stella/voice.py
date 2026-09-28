@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from stella.config import Settings
 from stella.store import CallJob
@@ -24,6 +25,11 @@ If this is a briefing call, read the briefing text clearly, ask if they heard
 it, then hang up. Do not add extra commentary beyond the briefing text.
 """
 
+KICKOFF_TEXT = (
+    "The other party just answered the phone. "
+    "Begin the call now using only the brief and context."
+)
+
 
 def build_instructions(job: CallJob) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
@@ -35,6 +41,24 @@ def build_instructions(job: CallJob) -> str:
         f"Brief / task:\n{job.brief.strip()}\n\n"
         f"Extra context from the dispatcher (this is all you have):\n{ctx}\n"
     )
+
+
+def hang_up_tool_openai() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "hang_up",
+        "description": "End the phone call after the task is complete.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "outcome": {
+                    "type": "string",
+                    "description": "One-sentence result of the call.",
+                }
+            },
+            "required": ["outcome"],
+        },
+    }
 
 
 class VoiceSession:
@@ -62,9 +86,14 @@ class VoiceSession:
         self._grok_ws = None
         self._closed = False
         self._assistant_bits: list[str] = []
+        self.provider = "grok"
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
+        await self.connect()
+        await self.run()
+
+    async def connect(self) -> None:
         url = f"{self.settings.xai_realtime_url}?model={self.settings.xai_voice_model}"
         headers = {"Authorization": f"Bearer {self.bearer_token}"}
         try:
@@ -86,28 +115,11 @@ class VoiceSession:
                             "input": {"format": {"type": "audio/pcmu", "rate": 8000}},
                             "output": {"format": {"type": "audio/pcmu", "rate": 8000}},
                         },
-                        "tools": [
-                            {
-                                "type": "function",
-                                "name": "hang_up",
-                                "description": "End the phone call after the task is complete.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "outcome": {
-                                            "type": "string",
-                                            "description": "One-sentence result of the call.",
-                                        }
-                                    },
-                                    "required": ["outcome"],
-                                },
-                            }
-                        ],
+                        "tools": [hang_up_tool_openai()],
                     },
                 }
             )
         )
-        # Kick off with a silent cue so Stella greets / reads the briefing.
         await self._grok_ws.send(
             json.dumps(
                 {
@@ -118,10 +130,7 @@ class VoiceSession:
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": (
-                                    "The other party just answered the phone. "
-                                    "Begin the call now using only the brief and context."
-                                ),
+                                "text": KICKOFF_TEXT,
                             }
                         ],
                     },
@@ -130,8 +139,7 @@ class VoiceSession:
         )
         await self._grok_ws.send(json.dumps({"type": "response.create"}))
 
-        import asyncio
-
+    async def run(self) -> None:
         await asyncio.gather(self._pump_telnyx(), self._pump_grok())
 
     async def _pump_telnyx(self) -> None:
@@ -239,3 +247,84 @@ class VoiceSession:
                 await ws.close()
             except Exception:
                 pass
+
+
+async def start_voice_bridge(
+    *,
+    settings: Settings,
+    job: CallJob,
+    telnyx_ws,
+    grok_token_fn: Callable[[], str],
+    grok_connect,
+    hangup_cb,
+    transcript_cb,
+    outcome_cb,
+    provider_cb: Callable[[str], None] | None = None,
+    gemini_connect=None,
+) -> str:
+    """Open Grok Voice first; on session connect failure, fall back to Gemini Live.
+
+    Returns the provider name that actually connected (`grok` or `gemini`).
+    """
+    from stella.gemini_voice import GeminiVoiceSession
+
+    grok_error: Exception | None = None
+    token: str | None = None
+    try:
+        token = grok_token_fn()
+    except Exception as exc:
+        grok_error = exc
+        logger.warning("Grok credentials unavailable (%s); will try Gemini if configured", exc)
+
+    if token:
+        session = VoiceSession(
+            settings=settings,
+            job=job,
+            bearer_token=token,
+            grok_connect=grok_connect,
+            hangup_cb=hangup_cb,
+            transcript_cb=transcript_cb,
+            outcome_cb=outcome_cb,
+        )
+        session._telnyx_ws = telnyx_ws
+        try:
+            await session.connect()
+            if provider_cb:
+                provider_cb("grok")
+            await session.run()
+            return "grok"
+        except Exception as exc:
+            grok_error = exc
+            logger.warning("Grok Voice session failed (%s); trying Gemini Live fallback", exc)
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+    gemini_key = (settings.gemini_api_key or "").strip()
+    if not gemini_key:
+        grok_msg = str(grok_error) if grok_error else "Grok Voice was not used"
+        raise RuntimeError(
+            f"{grok_msg}. Gemini Live fallback is not available because GEMINI_API_KEY is not set."
+        )
+
+    gem = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=gemini_connect or grok_connect,
+        hangup_cb=hangup_cb,
+        transcript_cb=transcript_cb,
+        outcome_cb=outcome_cb,
+    )
+    gem._telnyx_ws = telnyx_ws
+    try:
+        await gem.connect()
+        if provider_cb:
+            provider_cb("gemini")
+        await gem.run()
+        return "gemini"
+    except Exception as gem_err:
+        grok_msg = str(grok_error) if grok_error else "Grok Voice was not attempted"
+        raise RuntimeError(
+            f"Both voice providers failed. Grok: {grok_msg}. Gemini: {gem_err}"
+        ) from gem_err

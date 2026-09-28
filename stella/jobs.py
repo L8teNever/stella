@@ -40,8 +40,21 @@ class JobService:
         to_e164 = normalize_e164(to)
         if not (brief or "").strip():
             raise StellaError("Missing `brief` (task / script context).", "invalid_brief")
-        # Fail fast on auth so Ida sees a clear MCP error instead of a silent queued job.
-        _ = self.xai.bearer_token()
+        # Fail fast so Ida sees a clear MCP error instead of a silent queued job.
+        grok_ok = False
+        grok_err: StellaError | None = None
+        try:
+            _ = self.xai.bearer_token()
+            grok_ok = True
+        except StellaError as exc:
+            grok_err = exc
+        gemini_ok = bool((self.settings.gemini_api_key or "").strip())
+        if not grok_ok and not gemini_ok:
+            raise StellaError(
+                (grok_err.message if grok_err else "No xAI credentials.")
+                + " Set GEMINI_API_KEY to enable Gemini Live as a voice fallback.",
+                "voice_auth_missing",
+            )
         job = self.store.create(
             kind=kind,
             to_number=to_e164,

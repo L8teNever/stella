@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     xai_oauth_client_id: str = "b1a00492-073a-47ea-816f-4c329264a828"
     xai_realtime_url: str = "wss://api.x.ai/v1/realtime"
 
+    gemini_api_key: str = ""
+    gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-09-2025"
+    gemini_voice: str = "Puck"
+    gemini_realtime_url: str = (
+        "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    )
+
     def data_dir(self) -> Path:
         p = Path(self.stella_db_path).parent
         p.mkdir(parents=True, exist_ok=True)

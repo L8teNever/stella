@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from typing import Any, Callable
 
 from stella.config import Settings
@@ -117,7 +118,30 @@ the conversation, call the hang_up tool.
 
 If this is a briefing call, read the briefing text clearly, ask if they heard
 it, then hang up. Do not add extra commentary beyond the briefing text.
+
+Start speaking as soon as the other party finishes. Keep turns short (one or
+two sentences when possible). Never narrate internal reasoning, planning
+headings, or scratch thoughts — speak only what the other party should hear.
 """
+
+_GERMAN_HINT = re.compile(
+    r"[äöüÄÖÜß]|\b(deutsch|german|hallo|bitte|danke|guten|reservier|"
+    r"termin|anruf|sprich)\b",
+    re.IGNORECASE,
+)
+
+
+def job_wants_german(job: CallJob) -> bool:
+    """True when speak_to / brief / context / dest look German (e.g. +49)."""
+    blob = " ".join(
+        part
+        for part in (job.speak_to, job.brief, job.context, getattr(job, "to_number", "") or "")
+        if part
+    )
+    compact = blob.replace(" ", "")
+    if "+49" in compact:
+        return True
+    return bool(_GERMAN_HINT.search(blob))
 
 KICKOFF_TEXT = (
     "The other party just answered the phone. "
@@ -127,10 +151,17 @@ KICKOFF_TEXT = (
 
 def build_instructions(job: CallJob) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
+    lang = ""
+    if job_wants_german(job):
+        lang = (
+            "Speak German unless the other party switches language. "
+            "Reply immediately; do not pause to 'think out loud'.\n"
+        )
     ctx = job.context.strip() or "(none provided)"
     return (
         f"{STELLA_SYSTEM}\n\n"
         f"{speak}"
+        f"{lang}"
         f"Job type: {job.kind}\n"
         f"Brief / task:\n{job.brief.strip()}\n\n"
         f"Extra context from the dispatcher (this is all you have):\n{ctx}\n"

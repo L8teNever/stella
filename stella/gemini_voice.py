@@ -30,6 +30,21 @@ def gemini_model_name(settings: Settings) -> str:
     return model
 
 
+def gemini_realtime_input_config(settings: Settings) -> dict[str, Any]:
+    """Phone-tuned Gemini Live VAD (BidiGenerateContent realtimeInputConfig)."""
+    return {
+        "automaticActivityDetection": {
+            "disabled": False,
+            "startOfSpeechSensitivity": settings.gemini_vad_start_sensitivity,
+            "endOfSpeechSensitivity": settings.gemini_vad_end_sensitivity,
+            "prefixPaddingMs": int(settings.gemini_vad_prefix_padding_ms),
+            "silenceDurationMs": int(settings.gemini_vad_silence_duration_ms),
+        },
+        "activityHandling": settings.gemini_vad_activity_handling,
+        "turnCoverage": settings.gemini_vad_turn_coverage,
+    }
+
+
 def hang_up_tool_gemini() -> dict[str, Any]:
     openai = hang_up_tool_openai()
     params = openai["parameters"]
@@ -119,6 +134,7 @@ class GeminiVoiceSession:
             "tools": [hang_up_tool_gemini()],
             "outputAudioTranscription": {},
             "inputAudioTranscription": {},
+            "realtimeInputConfig": gemini_realtime_input_config(self.settings),
         }
 
     async def run(self) -> None:
@@ -212,6 +228,8 @@ class GeminiVoiceSession:
             logger.error("Gemini Live error: %s", event)
             return
         server = event.get("serverContent") or {}
+        if server.get("interrupted"):
+            await self._on_barge_in()
         model_turn = server.get("modelTurn") or {}
         for part in model_turn.get("parts") or []:
             inline = part.get("inlineData") or {}
@@ -220,10 +238,8 @@ class GeminiVoiceSession:
             if data and "audio" in mime.lower():
                 for payload in self._down.convert_frames_b64(data, mime):
                     await self.guard.send_outbound_pcmu(self._telnyx_ws, payload)
-            text = part.get("text")
-            if text:
-                self._assistant_bits.append(text)
-                self._transcript(text)
+            # part.text is often model scratch / thinking, not spoken audio.
+            # Spoken text is outputTranscription only.
         out_tx = server.get("outputTranscription") or {}
         piece = out_tx.get("text") or ""
         if piece:
@@ -269,6 +285,11 @@ class GeminiVoiceSession:
             await self.guard.hangup_after_audio(self._hangup, lambda: self._closed)
         finally:
             await self.close()
+
+    async def _on_barge_in(self) -> None:
+        """Stop queued Telnyx playout when Gemini reports the user interrupted."""
+        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
+        await self._send_telnyx_clear()
 
     async def _send_telnyx_clear(self) -> None:
         if self._telnyx_ws:

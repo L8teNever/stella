@@ -84,6 +84,8 @@ If Grok cannot be used and `GEMINI_API_KEY` is empty, the job fails with an expl
 
 Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Aoede`, female). Grok remains `XAI_VOICE=eve`.
 
+Gemini Live end-of-speech is tuned for phone via `realtimeInputConfig.automaticActivityDetection`. Default `GEMINI_VAD_SILENCE_DURATION_MS=300` (try 200–400). Lower values answer faster after you stop talking; higher values tolerate mid-sentence pauses. `GEMINI_VAD_PREFIX_PADDING_MS` (default 20) is how much speech Google requires before committing start-of-speech. Barge-in (`START_OF_ACTIVITY_INTERRUPTS`) also sends Telnyx `clear` so old audio stops immediately.
+
 ## Telnyx
 
 1. Create a Call Control application / Voice API connection.

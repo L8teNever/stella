@@ -39,6 +39,13 @@ class Settings(BaseSettings):
         "wss://generativelanguage.googleapis.com/ws/"
         "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     )
+    # Gemini Live VAD (BidiGenerateContent realtimeInputConfig). Tuned for phone.
+    gemini_vad_silence_duration_ms: int = 300
+    gemini_vad_prefix_padding_ms: int = 20
+    gemini_vad_start_sensitivity: str = "START_SENSITIVITY_HIGH"
+    gemini_vad_end_sensitivity: str = "END_SENSITIVITY_HIGH"
+    gemini_vad_activity_handling: str = "START_OF_ACTIVITY_INTERRUPTS"
+    gemini_vad_turn_coverage: str = "TURN_INCLUDES_ONLY_ACTIVITY"
 
     def data_dir(self) -> Path:
         p = Path(self.stella_db_path).parent

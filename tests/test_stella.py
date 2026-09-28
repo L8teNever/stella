@@ -18,8 +18,13 @@ from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
-from stella.gemini_voice import GeminiVoiceSession, gemini_model_name, gemini_ws_url
-from stella.voice import VoiceSession, build_instructions, start_voice_bridge
+from stella.gemini_voice import (
+    GeminiVoiceSession,
+    gemini_model_name,
+    gemini_realtime_input_config,
+    gemini_ws_url,
+)
+from stella.voice import VoiceSession, build_instructions, job_wants_german, start_voice_bridge
 from stella.voice_provider import (
     GROK_DOWN_CACHE_TTL_SECONDS,
     VoiceProviderChooser,
@@ -201,6 +206,9 @@ def test_instructions_contain_only_job_context(tmp_path):
     assert "Franz" in text
     assert "Ida" in text  # explicit isolation note
     assert "do NOT share" in text or "do not share" in text.lower() or "NOT Ida" in text
+    assert "Never narrate internal reasoning" in text
+    assert "Speak German" not in text
+    assert not job_wants_german(job)
 
 
 def test_mcp_tools_registered(tmp_path):
@@ -939,3 +947,98 @@ async def test_voice_session_hangup_waits_for_outbound(tmp_path):
     session.guard.mark_started()
     await session.guard.hangup_after_audio(hangup, lambda: False)
     assert hung == [1]
+
+
+def test_gemini_setup_includes_phone_vad(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        gemini_api_key="g-key",
+        gemini_vad_silence_duration_ms=250,
+        gemini_vad_prefix_padding_ms=15,
+    )
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    payload = session._setup_payload()
+    vad = payload["realtimeInputConfig"]
+    aad = vad["automaticActivityDetection"]
+    assert aad["disabled"] is False
+    assert aad["startOfSpeechSensitivity"] == "START_SENSITIVITY_HIGH"
+    assert aad["endOfSpeechSensitivity"] == "END_SENSITIVITY_HIGH"
+    assert aad["silenceDurationMs"] == 250
+    assert aad["prefixPaddingMs"] == 15
+    assert vad["activityHandling"] == "START_OF_ACTIVITY_INTERRUPTS"
+    assert vad["turnCoverage"] == "TURN_INCLUDES_ONLY_ACTIVITY"
+    cfg = gemini_realtime_input_config(settings)
+    assert cfg == vad
+    assert payload["generationConfig"]["responseModalities"] == ["AUDIO"]
+    assert "Never narrate internal reasoning" in payload["systemInstruction"]["parts"][0]["text"]
+
+
+def test_instructions_german_when_brief_is_de(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(
+        kind="call",
+        to_number="+4915112345678",
+        brief="Reserviere einen Tisch für morgen 19 Uhr.",
+        speak_to="Simon",
+    )
+    assert job_wants_german(job)
+    text = build_instructions(job)
+    assert "Speak German" in text
+
+
+@pytest.mark.asyncio
+async def test_gemini_transcript_skips_thinking_part_text(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    chunks: list[str] = []
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=chunks.append,
+        outcome_cb=lambda t: None,
+    )
+    await session._handle_gemini_event(
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [{"text": "**Initiating Pleasantries** I will greet them."}]
+                },
+                "outputTranscription": {"text": "Hallo, hier ist Stella."},
+            }
+        }
+    )
+    assert chunks == ["Hallo, hier ist Stella."]
+    assert session._assistant_bits == ["Hallo, hier ist Stella."]
+
+
+@pytest.mark.asyncio
+async def test_gemini_interrupted_sends_telnyx_clear(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    telnyx = FakeTelnyxWS()
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    session._telnyx_ws = telnyx
+    session.guard.mark_started()
+    await session._handle_gemini_event({"serverContent": {"interrupted": True}})
+    assert any(json.loads(s).get("event") == "clear" for s in telnyx.sent)

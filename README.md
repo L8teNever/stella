@@ -72,13 +72,15 @@ If both OAuth tokens and `XAI_API_KEY` exist, **OAuth wins** (subscription quota
 
 Voice model default: `grok-voice-latest` (`XAI_VOICE_MODEL`). Voice: `XAI_VOICE=eve`.
 
-## Gemini Live fallback
+## Gemini Live fallback (sticky per call)
 
-Grok remains the primary realtime path. On **session connect** failure (HTTP 403, auth, rate/limit, websocket errors, missing Grok credentials), Stella opens Gemini Live (`BidiGenerateContent`) for that call instead. MCP tools (`stella_call`, etc.) are unchanged.
+Grok remains the primary realtime path. When MCP starts a call (`stella_call` / `stella_briefing_call`), Stella probes Grok Voice realtime **once**. Success → **Grok for the entire call**. Failure (HTTP 403, auth, quota/limit, connect) → **Gemini Live for the entire call**. That choice is stored on the job (`voice_provider`) and reused if Telnyx reconnects `/media/{job_id}`. There is no mid-call re-probe and no fallback after the session is already running.
 
-Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants **PCM 16-bit LE / 16 kHz in** and typically **24 kHz PCM out**, so Stella box-filter downsamples, μ-law-encodes, and emits aligned 20 ms frames on the bridge. `GET /health` reports `voice_provider.primary/fallback` and whether `GEMINI_API_KEY` is set. After a media session connects, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
+Grok-down cache (bonus, in-memory, this process only): a failed Grok probe is remembered for **`GROK_DOWN_CACHE_TTL_SECONDS` = 300 (5 minutes)** so the next MCP call does not pay the 403 handshake again. After the TTL, Stella probes Grok again. `GET /health` reports `voice_provider.sticky`, `grok_down_cache_ttl_seconds`, and `grok_down_cached`.
 
-If Grok fails and `GEMINI_API_KEY` is empty, the job fails with an explicit error. If both providers fail, the error includes both reasons.
+Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants **PCM 16-bit LE / 16 kHz in** and typically **24 kHz PCM out**, so Stella box-filter downsamples, μ-law-encodes, and emits aligned 20 ms frames on the bridge. After a job is created, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
+
+If Grok cannot be used and `GEMINI_API_KEY` is empty, the job fails with an explicit error before dial (or the media session fails if only Gemini was locked).
 
 Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Aoede`, female). Grok remains `XAI_VOICE=eve`.
 
@@ -89,7 +91,7 @@ Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Aoede`, female
 3. Copy API key, connection id, and webhook public key.
 4. Point the connection’s webhook at `{STELLA_PUBLIC_BASE_URL}/webhooks/telnyx` (Stella also sends `webhook_url` on each dial).
 
-Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to Grok Voice (or Gemini Live after a Grok connect failure). Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
+Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to the provider chosen at MCP call start (Grok Voice or Gemini Live). Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
 
 ## MCP (Ida / Cursor / Grok Bot)
 

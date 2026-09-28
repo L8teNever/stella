@@ -14,6 +14,7 @@ from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.voice import start_voice_bridge
+from stella.voice_provider import GROK_DOWN_CACHE_TTL_SECONDS, VoiceProviderChooser
 from stella.webhooks import verify_telnyx_signature
 from stella.xai_auth import XAIAuth
 
@@ -26,7 +27,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store = JobStore(settings.stella_db_path)
     telnyx = TelnyxClient(settings)
     xai = XAIAuth(settings)
-    jobs = JobService(settings, store, telnyx, xai)
+    voice_chooser = VoiceProviderChooser(settings, xai)
+    jobs = JobService(settings, store, telnyx, xai, voice_chooser=voice_chooser)
     mcp = build_mcp(jobs)
     mcp_asgi = mcp.streamable_http_app()
 
@@ -52,6 +54,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "voice_provider": {
                 "primary": "grok",
                 "fallback": "gemini",
+                "sticky": "per_call_job",
+                "grok_down_cache_ttl_seconds": GROK_DOWN_CACHE_TTL_SECONDS,
+                "grok_down_cached": bool(voice_chooser.grok_down_cached()),
                 "grok": xai.auth_mode(),
                 "gemini": "api_key" if (settings.gemini_api_key or "").strip() else "none",
             },
@@ -164,6 +169,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def provider_cb(name: str) -> None:
             store.update(job_id, voice_provider=name)
 
+        locked = (job.voice_provider or "").strip().lower()
+        if locked not in {"grok", "gemini"}:
+            # Job created before sticky selection; choose once and persist.
+            locked = jobs.voice_chooser.choose()
+            store.update(job_id, voice_provider=locked)
+            job = store.get(job_id) or job
+
         try:
             await start_voice_bridge(
                 settings=settings,
@@ -176,6 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 outcome_cb=outcome_cb,
                 provider_cb=provider_cb,
                 gemini_connect=grok_connect,
+                locked_provider=locked,
             )
         except WebSocketDisconnect:
             pass

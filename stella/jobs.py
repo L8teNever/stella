@@ -10,6 +10,7 @@ from stella.config import Settings
 from stella.errors import StellaError, normalize_e164
 from stella.store import CallJob, JobStore
 from stella.telnyx_client import TelnyxClient
+from stella.voice_provider import VoiceProviderChooser
 from stella.xai_auth import XAIAuth
 
 logger = logging.getLogger(__name__)
@@ -22,11 +23,13 @@ class JobService:
         store: JobStore,
         telnyx: TelnyxClient,
         xai: XAIAuth,
+        voice_chooser: VoiceProviderChooser | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.telnyx = telnyx
         self.xai = xai
+        self.voice_chooser = voice_chooser or VoiceProviderChooser(settings, xai)
 
     def place_call(
         self,
@@ -40,21 +43,8 @@ class JobService:
         to_e164 = normalize_e164(to)
         if not (brief or "").strip():
             raise StellaError("Missing `brief` (task / script context).", "invalid_brief")
-        # Fail fast so Ida sees a clear MCP error instead of a silent queued job.
-        grok_ok = False
-        grok_err: StellaError | None = None
-        try:
-            _ = self.xai.bearer_token()
-            grok_ok = True
-        except StellaError as exc:
-            grok_err = exc
-        gemini_ok = bool((self.settings.gemini_api_key or "").strip())
-        if not grok_ok and not gemini_ok:
-            raise StellaError(
-                (grok_err.message if grok_err else "No xAI credentials.")
-                + " Set GEMINI_API_KEY to enable Gemini Live as a voice fallback.",
-                "voice_auth_missing",
-            )
+        # One Grok realtime probe (or cache hit) for this job — sticky for the call.
+        provider = self.voice_chooser.choose()
         job = self.store.create(
             kind=kind,
             to_number=to_e164,
@@ -62,6 +52,7 @@ class JobService:
             context=(context or "").strip(),
             speak_to=(speak_to or "").strip(),
         )
+        self.store.update(job.id, voice_provider=provider)
         webhook = self.settings.public_http_url("/webhooks/telnyx")
         stream = self.settings.public_ws_url(f"/media/{job.id}")
         client_state = base64_json({"job_id": job.id})
@@ -78,6 +69,7 @@ class JobService:
         self.store.update(
             job.id,
             status="dialing",
+            voice_provider=provider,
             telnyx_call_control_id=dialed.get("call_control_id") or "",
             telnyx_call_leg_id=dialed.get("call_leg_id") or "",
         )

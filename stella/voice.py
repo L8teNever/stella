@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
 import base64
 import json
 import logging
@@ -106,22 +107,16 @@ class TelnyxMediaGuard:
             await result
 
 
-STELLA_SYSTEM = """You are Stella, a phone agent placing a live outbound call.
-You are NOT Ida and you do NOT share Ida's memory, chat, or MCP tools.
-You may use ONLY the job brief and extra context below. If the other party asks
-something that is not in that material, say honestly that you don't know.
-Do not invent facts, names, times, or numbers.
+STELLA_SYSTEM = """You are Stella, a live phone agent. Not Ida; no memory except the brief below.
+If asked something not in the brief/context, say you don't know. Do not invent facts.
 
-Complete the task, confirm the outcome in one short sentence if possible,
-then say a polite goodbye. When the task is done or the other party hangs up
-the conversation, call the hang_up tool.
+Keep turns short. Answer immediately; never narrate reasoning.
 
-If this is a briefing call, read the briefing text clearly, ask if they heard
-it, then hang up. Do not add extra commentary beyond the briefing text.
+When the task is done, they say goodbye, or you have nothing left to ask: say a
+brief goodbye if needed AND call hang_up. Spoken goodbye does not end the PSTN
+call — hang_up does. Do not wait for extra confirmation or linger.
 
-Start speaking as soon as the other party finishes. Keep turns short (one or
-two sentences when possible). Never narrate internal reasoning, planning
-headings, or scratch thoughts — speak only what the other party should hear.
+Briefings: read the text, ask if they heard it, then call hang_up.
 """
 
 _GERMAN_HINT = re.compile(
@@ -143,10 +138,7 @@ def job_wants_german(job: CallJob) -> bool:
         return True
     return bool(_GERMAN_HINT.search(blob))
 
-KICKOFF_TEXT = (
-    "The other party just answered the phone. "
-    "Begin the call now using only the brief and context."
-)
+KICKOFF_TEXT = "They answered. Start from the brief now."
 
 
 def build_instructions(job: CallJob) -> str:
@@ -172,7 +164,11 @@ def hang_up_tool_openai() -> dict[str, Any]:
     return {
         "type": "function",
         "name": "hang_up",
-        "description": "End the phone call after the task is complete.",
+        "description": (
+            "End the live phone call now. Call this when the task is complete, "
+            "the other party says goodbye, a briefing was delivered, or there is "
+            "nothing left to ask. Required to actually hang up the PSTN leg."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -184,6 +180,69 @@ def hang_up_tool_openai() -> dict[str, Any]:
             "required": ["outcome"],
         },
     }
+
+
+def parse_hang_up_args(args: Any) -> str:
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return args or "Call completed."
+    if not isinstance(args, dict):
+        return "Call completed."
+    return str(args.get("outcome") or "Call completed.")
+
+
+FAREWELL_RE = re.compile(
+    r"(tsch+ü+ss|tschuss|tschüss|auf wiederh[öo]ren|auf wiedersehen|"
+    r"goodbye|good\s*bye|\bbye\b|ciao)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_farewell(text: str) -> bool:
+    return bool(text and FAREWELL_RE.search(text))
+
+
+class FarewellHangupWatch:
+    """If spoken transcript is a farewell and inbound stays quiet, hang up once."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        delay_s: float,
+        arm,
+        sleep: Callable[[float], Any] | None = None,
+    ) -> None:
+        self.enabled = enabled
+        self.delay_s = max(0.05, float(delay_s))
+        self._arm = arm
+        self._sleep = sleep or asyncio.sleep
+        self._task: asyncio.Task | None = None
+        self._armed = False
+
+    def note_user_speech(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+    def note_assistant_text(self, text: str) -> None:
+        if not self.enabled or self._armed or not looks_like_farewell(text):
+            return
+        if self._task and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._fire())
+
+    async def _fire(self) -> None:
+        try:
+            await self._sleep(self.delay_s)
+        except asyncio.CancelledError:
+            return
+        if self._armed:
+            return
+        self._armed = True
+        self._arm("Call ended after farewell.")
 
 
 class VoiceSession:
@@ -213,6 +272,11 @@ class VoiceSession:
         self._assistant_bits: list[str] = []
         self.provider = "grok"
         self.guard = TelnyxMediaGuard()
+        self._farewell = FarewellHangupWatch(
+            enabled=bool(settings.stella_farewell_hangup),
+            delay_s=settings.stella_farewell_hangup_s,
+            arm=self._arm_hangup_from_farewell,
+        )
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -297,6 +361,13 @@ class VoiceSession:
                         continue
                     payload = media.get("payload") or media.get("chunk")
                     if payload and self._grok_ws:
+                        try:
+                            ulaw = base64.b64decode(payload)
+                            rms = audioop.rms(audioop.ulaw2lin(ulaw, 2), 2) if ulaw else 0
+                        except Exception:
+                            rms = 0
+                        if rms >= int(self.settings.stella_client_vad_rms):
+                            self._farewell.note_user_speech()
                         await self._grok_ws.send(
                             json.dumps(
                                 {
@@ -337,18 +408,11 @@ class VoiceSession:
             if piece:
                 self._assistant_bits.append(piece)
                 self._transcript(piece)
+                self._farewell.note_assistant_text(piece)
         elif etype == "response.output_item.done":
             item = event.get("item") or {}
             if item.get("type") == "function_call" and item.get("name") == "hang_up":
-                args = item.get("arguments") or "{}"
-                if isinstance(args, str):
-                    try:
-                        parsed = json.loads(args)
-                    except json.JSONDecodeError:
-                        parsed = {"outcome": args}
-                else:
-                    parsed = args
-                outcome = str(parsed.get("outcome") or "Call completed.")
+                outcome = parse_hang_up_args(item.get("arguments") or "{}")
                 self._outcome(outcome)
                 if self._grok_ws:
                     await self._grok_ws.send(
@@ -366,6 +430,12 @@ class VoiceSession:
                 self.guard.arm_hangup(self._deferred_hangup)
         elif etype == "error":
             logger.error("Grok Voice error: %s", event)
+
+    def _arm_hangup_from_farewell(self, outcome: str) -> None:
+        if self._closed:
+            return
+        self._outcome(outcome)
+        self.guard.arm_hangup(self._deferred_hangup)
 
     async def _deferred_hangup(self) -> None:
         try:

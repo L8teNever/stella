@@ -205,8 +205,9 @@ def test_instructions_contain_only_job_context(tmp_path):
     assert "Book a table." in text
     assert "Franz" in text
     assert "Ida" in text  # explicit isolation note
-    assert "do NOT share" in text or "do not share" in text.lower() or "NOT Ida" in text
-    assert "Never narrate internal reasoning" in text
+    assert "Not Ida" in text or "NOT Ida" in text
+    assert "hang_up" in text
+    assert "never narrate reasoning" in text.lower()
     assert "Speak German" not in text
     assert not job_wants_german(job)
 
@@ -953,6 +954,7 @@ def test_gemini_setup_includes_phone_vad(tmp_path):
     settings = make_settings(
         tmp_path,
         gemini_api_key="g-key",
+        stella_client_vad=False,
         gemini_vad_silence_duration_ms=250,
         gemini_vad_prefix_padding_ms=15,
     )
@@ -979,7 +981,8 @@ def test_gemini_setup_includes_phone_vad(tmp_path):
     cfg = gemini_realtime_input_config(settings)
     assert cfg == vad
     assert payload["generationConfig"]["responseModalities"] == ["AUDIO"]
-    assert "Never narrate internal reasoning" in payload["systemInstruction"]["parts"][0]["text"]
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert "call hang_up" in payload["systemInstruction"]["parts"][0]["text"]
 
 
 def test_instructions_german_when_brief_is_de(tmp_path):
@@ -1042,3 +1045,148 @@ async def test_gemini_interrupted_sends_telnyx_clear(tmp_path):
     session.guard.mark_started()
     await session._handle_gemini_event({"serverContent": {"interrupted": True}})
     assert any(json.loads(s).get("event") == "clear" for s in telnyx.sent)
+
+
+def _pcm16_frame(amplitude: int, frames: int = 1) -> bytes:
+    from stella.audio_pcmu import pack_pcm16le
+
+    return pack_pcm16le([amplitude] * (320 * frames))
+
+
+def test_energy_vad_emits_start_then_end_after_silence():
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=80))
+    events: list[str] = []
+    for _ in range(4):
+        events.extend(vad.feed(_pcm16_frame(8000)))
+    assert events == ["start"]
+    events = []
+    for _ in range(5):
+        events.extend(vad.feed(_pcm16_frame(0)))
+    assert events == ["end"]
+
+
+def test_gemini_setup_client_vad_disables_automatic(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key", stella_client_vad=True)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    payload = session._setup_payload()
+    aad = payload["realtimeInputConfig"]["automaticActivityDetection"]
+    assert aad == {"disabled": True}
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+
+
+@pytest.mark.asyncio
+async def test_gemini_client_vad_sends_activity_end(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        gemini_api_key="g-key",
+        stella_client_vad=True,
+        stella_client_vad_min_speech_ms=20,
+        stella_client_vad_silence_ms=40,
+        stella_client_vad_rms=200,
+    )
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+
+    class DummyGemini:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data) if isinstance(data, str) else data)
+
+    session._gemini_ws = DummyGemini()
+    await session._forward_inbound_pcm(_pcm16_frame(9000, 2))
+    await session._forward_inbound_pcm(_pcm16_frame(0, 4))
+    kinds = []
+    for msg in session._gemini_ws.sent:
+        ri = msg.get("realtimeInput") or {}
+        if "activityStart" in ri:
+            kinds.append("start")
+        elif "activityEnd" in ri:
+            kinds.append("end")
+        elif "audio" in ri:
+            kinds.append("audio")
+    assert "start" in kinds and "end" in kinds
+    assert kinds.index("start") < kinds.index("end")
+    assert any(k == "audio" for k in kinds)
+
+
+@pytest.mark.asyncio
+async def test_gemini_farewell_hangup_backup(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        gemini_api_key="g-key",
+        stella_farewell_hangup=True,
+        stella_farewell_hangup_s=0.05,
+    )
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    hung: list[bool] = []
+    outcomes: list[str] = []
+
+    async def hangup():
+        hung.append(True)
+
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=hangup,
+        transcript_cb=lambda c: None,
+        outcome_cb=outcomes.append,
+    )
+    session.guard.mark_started()
+    session.guard.hangup_playout_pad_s = 0.0
+    session.guard.hangup_wait_audio_s = 0.05
+    pcm24 = b"\x00\x10" * 480
+    payload = base64.b64encode(pcm24).decode("ascii")
+    session._telnyx_ws = FakeTelnyxWS()
+    await session._handle_gemini_event(
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [{"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": payload}}]
+                },
+                "outputTranscription": {"text": "Tschüss, auf Wiederhören!"},
+            }
+        }
+    )
+    await asyncio.sleep(0.2)
+    assert session.guard._hangup_task is not None
+    await session.guard._hangup_task
+    assert hung == [True]
+    assert outcomes and "farewell" in outcomes[0].lower()
+
+
+def test_looks_like_farewell():
+    from stella.voice import looks_like_farewell
+
+    assert looks_like_farewell("Ok, tschüss!")
+    assert looks_like_farewell("Goodbye")
+    assert not looks_like_farewell("What time works for you?")
+
+
+def test_hang_up_tool_requires_action():
+    from stella.voice import hang_up_tool_openai
+
+    desc = hang_up_tool_openai()["description"]
+    assert "hang up" in desc.lower() or "End the live" in desc

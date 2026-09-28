@@ -40,12 +40,24 @@ class Settings(BaseSettings):
         "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     )
     # Gemini Live VAD (BidiGenerateContent realtimeInputConfig). Tuned for phone.
+    # Ignored for end-of-speech when stella_client_vad is true (client activityEnd).
     gemini_vad_silence_duration_ms: int = 300
     gemini_vad_prefix_padding_ms: int = 20
     gemini_vad_start_sensitivity: str = "START_SENSITIVITY_HIGH"
     gemini_vad_end_sensitivity: str = "END_SENSITIVITY_HIGH"
     gemini_vad_activity_handling: str = "START_OF_ACTIVITY_INTERRUPTS"
     gemini_vad_turn_coverage: str = "TURN_INCLUDES_ONLY_ACTIVITY"
+    # 0 disables Gemini 2.5 thinking tokens (lowest TTFT). Negative omits the field.
+    gemini_thinking_budget: int = 0
+    # Local RMS VAD → activityStart/activityEnd (disables automaticActivityDetection).
+    stella_client_vad: bool = True
+    stella_client_vad_silence_ms: int = 120
+    stella_client_vad_min_speech_ms: int = 60
+    stella_client_vad_rms: int = 500
+    stella_latency_log: bool = False
+    # Backup hangup if spoken transcript is a farewell and user stays quiet.
+    stella_farewell_hangup: bool = True
+    stella_farewell_hangup_s: float = 1.5
 
     def data_dir(self) -> Path:
         p = Path(self.stella_db_path).parent

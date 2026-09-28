@@ -52,7 +52,8 @@ def build_mcp(service: JobService) -> FastMCP:
         """Call a number and read `text` aloud (e.g. a morning briefing), then hang up."""
         try:
             brief = (
-                "Read the following briefing aloud clearly, then confirm they heard it, then hang up.\n\n"
+                "Read the following briefing aloud clearly, confirm they heard it, "
+                "then call hang_up (do not keep the line open).\n\n"
                 + text
             )
             job = service.place_call(

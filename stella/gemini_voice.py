@@ -7,7 +7,7 @@ import logging
 from typing import Any
 from urllib.parse import urlencode
 
-from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k
+from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
 from stella.config import Settings
 from stella.store import CallJob
 from stella.voice import KICKOFF_TEXT, build_instructions, hang_up_tool_openai
@@ -77,7 +77,7 @@ class GeminiVoiceSession:
         self._closed = False
         self._assistant_bits: list[str] = []
         self._up = Pcmu8kToPcm16k()
-        self._down = PcmToPcmu8k(default_rate=24000)
+        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
         self.provider = "gemini"
 
     async def attach_telnyx(self, telnyx_ws) -> None:
@@ -106,7 +106,7 @@ class GeminiVoiceSession:
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
-                            "voiceName": self.settings.gemini_voice or "Puck",
+                            "voiceName": self.settings.gemini_voice or "Aoede",
                         }
                     }
                 },
@@ -152,7 +152,11 @@ class GeminiVoiceSession:
                     continue
                 event = msg.get("event")
                 if event == "media":
-                    payload = (msg.get("media") or {}).get("payload")
+                    media = msg.get("media") or {}
+                    track = (media.get("track") or "").lower()
+                    if track in {"outbound", "outbound_track"}:
+                        continue
+                    payload = media.get("payload") or media.get("chunk")
                     if payload and self._gemini_ws:
                         pcm = self._up.convert_b64(payload)
                         if not pcm:
@@ -206,8 +210,7 @@ class GeminiVoiceSession:
             data = inline.get("data")
             mime = inline.get("mimeType") or ""
             if data and "audio" in mime.lower() and self._telnyx_ws:
-                payload = self._down.convert_b64(data, mime)
-                if payload:
+                for payload in self._down.convert_frames_b64(data, mime):
                     await self._telnyx_ws.send_text(
                         json.dumps({"event": "media", "media": {"payload": payload}})
                     )

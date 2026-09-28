@@ -314,6 +314,10 @@ async def test_start_voice_bridge_falls_back_to_gemini_on_grok_403(tmp_path):
     assert provider == "gemini"
     assert seen == ["gemini"]
     assert gemini_ws.sent[0]["setup"]["model"].startswith("models/")
+    voice = gemini_ws.sent[0]["setup"]["generationConfig"]["speechConfig"]["voiceConfig"][
+        "prebuiltVoiceConfig"
+    ]["voiceName"]
+    assert voice == "Aoede"
 
 
 @pytest.mark.asyncio
@@ -385,9 +389,8 @@ async def test_gemini_hang_up_and_audio_out(tmp_path):
         outcome_cb=outcomes.append,
     )
     session._telnyx_ws = telnyx
-    import audioop as _audioop
 
-    pcm24 = _audioop.lin2lin(b"\x00\x10" * 48, 2, 2)
+    pcm24 = b"\x00\x10" * 480  # 20 ms at 24 kHz, 16-bit LE
     payload = base64.b64encode(pcm24).decode("ascii")
     await session._handle_gemini_event(
         {
@@ -409,6 +412,8 @@ async def test_gemini_hang_up_and_audio_out(tmp_path):
     assert telnyx.sent
     media = json.loads(telnyx.sent[0])
     assert media["event"] == "media"
+    raw_ulaw = base64.b64decode(media["media"]["payload"])
+    assert len(raw_ulaw) == 160
 
     class DummyGemini:
         def __init__(self):
@@ -440,9 +445,71 @@ def test_pcmu_roundtrip_and_mime_rate():
     down = PcmToPcmu8k(default_rate=16000)
     silence = base64.b64encode(b"\xff" * 160).decode("ascii")
     pcm = up.convert_b64(silence)
-    assert len(pcm) >= 600 and len(pcm) % 2 == 0
+    assert len(pcm) == 640
     back = down.convert_b64(base64.b64encode(pcm).decode("ascii"), "audio/pcm;rate=16000")
     assert back
+    assert len(base64.b64decode(back)) == 160
+
+
+def test_pcmu_24k_emits_aligned_20ms_frames():
+    from stella.audio_pcmu import TELNYX_FRAME_BYTES, downsample_integer, pack_pcm16le, unpack_pcm16le
+
+    # 45 ms of 24 kHz PCM (1080 samples) -> 15 ms leftover at 8 kHz until next chunk.
+    samples = [1000, -1000, 500] * 360  # 1080 samples = 45 ms @ 24 kHz
+    pcm = pack_pcm16le(samples)
+    down = PcmToPcmu8k(default_rate=24000)
+    frames = down.convert_frames_b64(base64.b64encode(pcm).decode("ascii"), "audio/pcm;rate=24000")
+    assert len(frames) == 2  # 40 ms; 5 ms held
+    for f in frames:
+        assert len(base64.b64decode(f)) == TELNYX_FRAME_BYTES
+
+    # Odd byte + remaining samples should complete another frame after more data.
+    extra = pack_pcm16le([1000, -1000, 500] * 120)  # +15 ms @ 8 kHz with 5 ms leftover -> 1 frame
+    more = down.convert_frames_b64(base64.b64encode(extra).decode("ascii"), "audio/pcm;rate=24000")
+    assert len(more) == 1
+    assert len(base64.b64decode(more[0])) == TELNYX_FRAME_BYTES
+    short = pack_pcm16le([0] * 3)  # 1 sample @ 8 kHz, held
+    assert down.convert_frames_b64(base64.b64encode(short).decode("ascii"), "audio/pcm;rate=24000") == []
+    tail = pack_pcm16le([0] * 477)  # 159 more @ 8 kHz -> one frame
+    flushed = down.convert_frames_b64(base64.b64encode(tail).decode("ascii"), "audio/pcm;rate=24000")
+    assert len(flushed) == 1
+    assert all(len(base64.b64decode(f)) == TELNYX_FRAME_BYTES for f in flushed)
+
+    averaged, leftover = downsample_integer([3, 6, 9, 12, 15], 3)
+    assert averaged == [6]
+    assert leftover == [12, 15]
+    assert unpack_pcm16le(b"\x01\x00\xff\xff") == [1, -1]
+
+    odd = PcmToPcmu8k()
+    chunk = pack_pcm16le([0] * 480) + b"\x01"  # trailing unpaired byte
+    frames = odd.convert_frames_b64(base64.b64encode(chunk).decode("ascii"), "audio/pcm;rate=24000")
+    assert len(frames) == 1
+    # leftover byte + rest of a 16-bit sample + 479 samples @24k = 480 samples -> 160 ulaw
+    rest = b"\x00" + pack_pcm16le([0] * 479)
+    frames2 = odd.convert_frames_b64(base64.b64encode(rest).decode("ascii"), "audio/pcm;rate=24000")
+    assert len(frames2) == 1
+    assert len(base64.b64decode(frames2[0])) == TELNYX_FRAME_BYTES
+
+
+def test_gemini_voice_default_is_female(tmp_path):
+    settings = make_settings(tmp_path)
+    assert settings.gemini_voice == "Aoede"
+    assert settings.xai_voice == "eve"
+
+
+def test_dial_keeps_inbound_track_for_bidirectional(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    telnyx = TelnyxClient(settings, transport=transport)
+    xai = XAIAuth(settings)
+    svc = JobService(settings, store, telnyx, xai)
+    svc.place_call(to="+14155552671", brief="hello")
+    payload = transport.calls[0][2]["json"]
+    assert payload["stream_track"] == "inbound_track"
+    assert payload["stream_bidirectional_mode"] == "rtp"
+    assert payload["stream_bidirectional_codec"] == "PCMU"
+    assert payload["stream_bidirectional_sampling_rate"] == 8000
 
 
 def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):

@@ -154,7 +154,11 @@ class VoiceSession:
                     continue
                 event = msg.get("event")
                 if event == "media":
-                    payload = (msg.get("media") or {}).get("payload")
+                    media = msg.get("media") or {}
+                    track = (media.get("track") or "").lower()
+                    if track in {"outbound", "outbound_track"}:
+                        continue
+                    payload = media.get("payload") or media.get("chunk")
                     if payload and self._grok_ws:
                         await self._grok_ws.send(
                             json.dumps(

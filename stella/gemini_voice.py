@@ -4,13 +4,22 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import Any
 from urllib.parse import urlencode
 
 from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
 from stella.config import Settings
+from stella.energy_vad import EnergyVad, EnergyVadConfig, pcm_rms
 from stella.store import CallJob
-from stella.voice import KICKOFF_TEXT, TelnyxMediaGuard, build_instructions, hang_up_tool_openai
+from stella.voice import (
+    KICKOFF_TEXT,
+    FarewellHangupWatch,
+    TelnyxMediaGuard,
+    build_instructions,
+    hang_up_tool_openai,
+    parse_hang_up_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +39,19 @@ def gemini_model_name(settings: Settings) -> str:
     return model
 
 
+def gemini_uses_client_vad(settings: Settings) -> bool:
+    return bool(settings.stella_client_vad)
+
+
 def gemini_realtime_input_config(settings: Settings) -> dict[str, Any]:
     """Phone-tuned Gemini Live VAD (BidiGenerateContent realtimeInputConfig)."""
+    if gemini_uses_client_vad(settings):
+        # activityStart/activityEnd are only accepted when automatic VAD is off.
+        return {
+            "automaticActivityDetection": {"disabled": True},
+            "activityHandling": settings.gemini_vad_activity_handling,
+            "turnCoverage": settings.gemini_vad_turn_coverage,
+        }
     return {
         "automaticActivityDetection": {
             "disabled": False,
@@ -43,6 +63,23 @@ def gemini_realtime_input_config(settings: Settings) -> dict[str, Any]:
         "activityHandling": settings.gemini_vad_activity_handling,
         "turnCoverage": settings.gemini_vad_turn_coverage,
     }
+
+
+def gemini_generation_config(settings: Settings) -> dict[str, Any]:
+    cfg: dict[str, Any] = {
+        "responseModalities": ["AUDIO"],
+        "speechConfig": {
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {
+                    "voiceName": settings.gemini_voice or "Aoede",
+                }
+            }
+        },
+    }
+    budget = int(settings.gemini_thinking_budget)
+    if budget >= 0:
+        cfg["thinkingConfig"] = {"thinkingBudget": budget}
+    return cfg
 
 
 def hang_up_tool_gemini() -> dict[str, Any]:
@@ -96,6 +133,22 @@ class GeminiVoiceSession:
         self.provider = "gemini"
         self.guard = TelnyxMediaGuard()
         self._setup_complete = asyncio.Event()
+        self._vad = EnergyVad(
+            EnergyVadConfig(
+                rms_threshold=int(settings.stella_client_vad_rms),
+                min_speech_ms=int(settings.stella_client_vad_min_speech_ms),
+                silence_ms=int(settings.stella_client_vad_silence_ms),
+            )
+        )
+        self._farewell = FarewellHangupWatch(
+            enabled=bool(settings.stella_farewell_hangup),
+            delay_s=settings.stella_farewell_hangup_s,
+            arm=self._arm_hangup_from_farewell,
+        )
+        self._t_setup_ms: float | None = None
+        self._t_activity_end_ms: float | None = None
+        self._logged_setup_audio = False
+        self._logged_turn_audio = False
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -118,16 +171,7 @@ class GeminiVoiceSession:
     def _setup_payload(self) -> dict[str, Any]:
         return {
             "model": gemini_model_name(self.settings),
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {
-                            "voiceName": self.settings.gemini_voice or "Aoede",
-                        }
-                    }
-                },
-            },
+            "generationConfig": gemini_generation_config(self.settings),
             "systemInstruction": {
                 "parts": [{"text": build_instructions(self.job)}]
             },
@@ -136,6 +180,12 @@ class GeminiVoiceSession:
             "inputAudioTranscription": {},
             "realtimeInputConfig": gemini_realtime_input_config(self.settings),
         }
+
+    def _latency(self, kind: str, **fields: Any) -> None:
+        if not self.settings.stella_latency_log:
+            return
+        extra = " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.info("stella_latency %s %s", kind, extra)
 
     async def run(self) -> None:
         await asyncio.gather(
@@ -187,18 +237,7 @@ class GeminiVoiceSession:
                         pcm = self._up.convert_b64(payload)
                         if not pcm:
                             continue
-                        await self._gemini_ws.send(
-                            json.dumps(
-                                {
-                                    "realtimeInput": {
-                                        "audio": {
-                                            "data": base64.b64encode(pcm).decode("ascii"),
-                                            "mimeType": "audio/pcm;rate=16000",
-                                        }
-                                    }
-                                }
-                            )
-                        )
+                        await self._forward_inbound_pcm(pcm)
                 elif event in {"stop", "closed"}:
                     break
         finally:
@@ -218,6 +257,8 @@ class GeminiVoiceSession:
                     continue
                 if "setupComplete" in event:
                     self._setup_complete.set()
+                    self._t_setup_ms = time.monotonic() * 1000
+                    self._latency("setup_complete")
                     continue
                 await self._handle_gemini_event(event)
         finally:
@@ -237,7 +278,9 @@ class GeminiVoiceSession:
             mime = inline.get("mimeType") or ""
             if data and "audio" in mime.lower():
                 for payload in self._down.convert_frames_b64(data, mime):
-                    await self.guard.send_outbound_pcmu(self._telnyx_ws, payload)
+                    sent = await self.guard.send_outbound_pcmu(self._telnyx_ws, payload)
+                    if sent:
+                        self._note_first_outbound()
             # part.text is often model scratch / thinking, not spoken audio.
             # Spoken text is outputTranscription only.
         out_tx = server.get("outputTranscription") or {}
@@ -245,18 +288,13 @@ class GeminiVoiceSession:
         if piece:
             self._assistant_bits.append(piece)
             self._transcript(piece)
+            self._farewell.note_assistant_text(piece)
 
         tool_call = event.get("toolCall") or {}
         for fc in tool_call.get("functionCalls") or []:
             if fc.get("name") != "hang_up":
                 continue
-            args = fc.get("args") or fc.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {"outcome": args}
-            outcome = str(args.get("outcome") or "Call completed.")
+            outcome = parse_hang_up_args(fc.get("args") or fc.get("arguments") or {})
             self._outcome(outcome)
             if self._gemini_ws:
                 await self._gemini_ws.send(
@@ -277,11 +315,60 @@ class GeminiVoiceSession:
             self.guard.arm_hangup(self._deferred_hangup)
             return
 
+    async def _forward_inbound_pcm(self, pcm: bytes) -> None:
+        assert self._gemini_ws is not None
+        client_vad = gemini_uses_client_vad(self.settings)
+        events = self._vad.feed(pcm) if client_vad else []
+        if not client_vad and pcm_rms(pcm) >= self.settings.stella_client_vad_rms:
+            self._farewell.note_user_speech()
+        for ev in events:
+            if ev == "start":
+                self._farewell.note_user_speech()
+                await self._gemini_ws.send(json.dumps({"realtimeInput": {"activityStart": {}}}))
+        await self._gemini_ws.send(
+            json.dumps(
+                {
+                    "realtimeInput": {
+                        "audio": {
+                            "data": base64.b64encode(pcm).decode("ascii"),
+                            "mimeType": "audio/pcm;rate=16000",
+                        }
+                    }
+                }
+            )
+        )
+        for ev in events:
+            if ev == "end":
+                self._t_activity_end_ms = time.monotonic() * 1000
+                self._logged_turn_audio = False
+                self._latency("activity_end")
+                await self._gemini_ws.send(json.dumps({"realtimeInput": {"activityEnd": {}}}))
+
+    def _note_first_outbound(self) -> None:
+        now = time.monotonic() * 1000
+        if not self._logged_setup_audio and self._t_setup_ms is not None:
+            self._logged_setup_audio = True
+            self._latency("setup_to_first_audio_ms", ms=round(now - self._t_setup_ms))
+        if not self._logged_turn_audio and self._t_activity_end_ms is not None:
+            self._logged_turn_audio = True
+            self._latency(
+                "silence_to_first_audio_ms",
+                ms=round(now - self._t_activity_end_ms),
+            )
+
+    def _arm_hangup_from_farewell(self, outcome: str) -> None:
+        if self._closed:
+            return
+        self._outcome(outcome)
+        self.guard.arm_hangup(self._deferred_hangup)
+
     async def _deferred_hangup(self) -> None:
         try:
             await self.guard.telnyx_started.wait()
             for leftover in self._down.flush_frames_b64():
-                await self.guard.send_outbound_pcmu(self._telnyx_ws, leftover)
+                sent = await self.guard.send_outbound_pcmu(self._telnyx_ws, leftover)
+                if sent:
+                    self._note_first_outbound()
             await self.guard.hangup_after_audio(self._hangup, lambda: self._closed)
         finally:
             await self.close()

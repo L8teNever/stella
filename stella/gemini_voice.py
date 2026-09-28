@@ -25,7 +25,15 @@ logger = logging.getLogger(__name__)
 
 # https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live
 # Live WebSocket get-started uses this id with responseModalities AUDIO.
+# Confirmed on Simon's key via v1beta listModels (bidiGenerateContent).
 DEFAULT_GEMINI_LIVE_MODEL = "gemini-3.8-live"
+# Tried only if the primary model's setup handshake fails (not mid-call).
+GEMINI_LIVE_SETUP_FALLBACKS = (
+    "gemini-3.1-flash-live-preview",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+    "gemini-2.5-flash-native-audio-latest",
+)
+SETUP_COMPLETE_TIMEOUT_S = 8.0
 
 
 def gemini_ws_url(settings: Settings) -> str:
@@ -34,20 +42,37 @@ def gemini_ws_url(settings: Settings) -> str:
     return f"{base}?{query}"
 
 
+def gemini_bare_model_id(model: str) -> str:
+    return (model or "").strip().removeprefix("models/")
+
+
 def gemini_model_id(settings: Settings) -> str:
-    return (settings.gemini_live_model or "").strip() or DEFAULT_GEMINI_LIVE_MODEL
+    return gemini_bare_model_id(settings.gemini_live_model) or DEFAULT_GEMINI_LIVE_MODEL
 
 
-def gemini_model_name(settings: Settings) -> str:
-    model = gemini_model_id(settings)
-    if not model.startswith("models/"):
-        model = f"models/{model}"
-    return model
+def gemini_live_try_order(settings: Settings) -> list[str]:
+    """Primary GEMINI_LIVE_MODEL, then documented Live fallbacks (no 09-2025)."""
+    order: list[str] = []
+    seen: set[str] = set()
+    for raw in (gemini_model_id(settings), *GEMINI_LIVE_SETUP_FALLBACKS):
+        model = gemini_bare_model_id(raw)
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        order.append(model)
+    return order
+
+
+def gemini_model_name(settings: Settings, model: str | None = None) -> str:
+    raw = gemini_bare_model_id(model) if model else gemini_model_id(settings)
+    if not raw.startswith("models/"):
+        raw = f"models/{raw}"
+    return raw
 
 
 def gemini_uses_thinking_level(model: str) -> bool:
     """Gemini 3.x Live uses thinkingLevel; 2.5 native-audio uses thinkingBudget."""
-    raw = model.lower().removeprefix("models/")
+    raw = gemini_bare_model_id(model).lower()
     if raw.startswith("gemini-2.5"):
         return False
     return raw.startswith("gemini-3")
@@ -79,7 +104,9 @@ def gemini_realtime_input_config(settings: Settings) -> dict[str, Any]:
     }
 
 
-def gemini_generation_config(settings: Settings) -> dict[str, Any]:
+def gemini_generation_config(
+    settings: Settings, model: str | None = None
+) -> dict[str, Any]:
     cfg: dict[str, Any] = {
         "responseModalities": ["AUDIO"],
         "speechConfig": {
@@ -92,11 +119,14 @@ def gemini_generation_config(settings: Settings) -> dict[str, Any]:
     }
     budget = int(settings.gemini_thinking_budget)
     if budget >= 0:
-        if gemini_uses_thinking_level(gemini_model_id(settings)):
-            # 3.x Live default is already minimal; send it explicitly for lowest TTFT.
-            cfg["thinkingConfig"] = {
-                "thinkingLevel": "minimal" if budget == 0 else "low"
+        mid = model if model is not None else gemini_model_id(settings)
+        if gemini_uses_thinking_level(mid):
+            # 3.x Live: thinkingLevel. Keep thinkingBudget=0 as well (lowest TTFT).
+            thinking: dict[str, Any] = {
+                "thinkingLevel": "minimal" if budget == 0 else "low",
+                "thinkingBudget": budget,
             }
+            cfg["thinkingConfig"] = thinking
         else:
             cfg["thinkingConfig"] = {"thinkingBudget": budget}
     return cfg
@@ -146,6 +176,7 @@ class GeminiVoiceSession:
         self._outcome = outcome_cb
         self._telnyx_ws = None
         self._gemini_ws = None
+        self._gemini_aiter = None
         self._closed = False
         self._assistant_bits: list[str] = []
         self._up = Pcmu8kToPcm16k()
@@ -169,6 +200,7 @@ class GeminiVoiceSession:
         self._t_activity_end_ms: float | None = None
         self._logged_setup_audio = False
         self._logged_turn_audio = False
+        self._active_model = gemini_model_id(settings)
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -178,20 +210,91 @@ class GeminiVoiceSession:
     async def connect(self) -> None:
         if not (self.settings.gemini_api_key or "").strip():
             raise RuntimeError("GEMINI_API_KEY is not set; cannot open Gemini Live session.")
+        last_exc: Exception | None = None
         url = gemini_ws_url(self.settings)
-        try:
-            self._gemini_ws = await self._gemini_connect(url, {})
-        except Exception as exc:
-            logger.exception("Gemini Live connect failed")
-            await self._send_telnyx_clear()
-            raise RuntimeError(f"Could not open Gemini Live session: {exc}") from exc
+        for model in gemini_live_try_order(self.settings):
+            self._active_model = model
+            try:
+                self._gemini_ws = await self._gemini_connect(url, {})
+                await self._gemini_ws.send(json.dumps({"setup": self._setup_payload()}))
+                await asyncio.wait_for(
+                    self._await_setup_complete(),
+                    timeout=SETUP_COMPLETE_TIMEOUT_S,
+                )
+                if model != gemini_model_id(self.settings):
+                    logger.warning("Gemini Live using fallback model %s", model)
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Gemini Live setup failed for %s: %s", model, exc)
+                ws = self._gemini_ws
+                self._gemini_ws = None
+                self._gemini_aiter = None
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+        await self._send_telnyx_clear()
+        raise RuntimeError(
+            f"Could not open Gemini Live session: {last_exc}"
+        ) from last_exc
 
-        await self._gemini_ws.send(json.dumps({"setup": self._setup_payload()}))
+    async def _await_setup_complete(self) -> None:
+        assert self._gemini_ws is not None
+        self._gemini_aiter = self._gemini_ws.__aiter__()
+        while True:
+            try:
+                raw = await self._gemini_aiter.__anext__()
+            except StopAsyncIteration as exc:
+                raise RuntimeError("Gemini Live closed before setupComplete") from exc
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("error"):
+                raise RuntimeError(f"Gemini Live setup error: {event['error']}")
+            if "setupComplete" in event:
+                self._setup_complete.set()
+                self._t_setup_ms = time.monotonic() * 1000
+                self._latency("setup_complete")
+                return
+
+    async def _pump_gemini(self) -> None:
+        assert self._gemini_ws is not None
+        agen = self._gemini_aiter or self._gemini_ws.__aiter__()
+        self._gemini_aiter = agen
+        try:
+            while True:
+                if self._closed:
+                    break
+                try:
+                    raw = await agen.__anext__()
+                except StopAsyncIteration:
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if "setupComplete" in event:
+                    self._setup_complete.set()
+                    if self._t_setup_ms is None:
+                        self._t_setup_ms = time.monotonic() * 1000
+                    self._latency("setup_complete")
+                    continue
+                await self._handle_gemini_event(event)
+        finally:
+            await self.close()
 
     def _setup_payload(self) -> dict[str, Any]:
+        model = self._active_model
         return {
-            "model": gemini_model_name(self.settings),
-            "generationConfig": gemini_generation_config(self.settings),
+            "model": gemini_model_name(self.settings, model),
+            "generationConfig": gemini_generation_config(self.settings, model),
             "systemInstruction": {
                 "parts": [{"text": build_instructions(self.job)}]
             },
@@ -260,27 +363,6 @@ class GeminiVoiceSession:
                         await self._forward_inbound_pcm(pcm)
                 elif event in {"stop", "closed"}:
                     break
-        finally:
-            await self.close()
-
-    async def _pump_gemini(self) -> None:
-        assert self._gemini_ws is not None
-        try:
-            async for raw in self._gemini_ws:
-                if self._closed:
-                    break
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8", errors="replace")
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if "setupComplete" in event:
-                    self._setup_complete.set()
-                    self._t_setup_ms = time.monotonic() * 1000
-                    self._latency("setup_complete")
-                    continue
-                await self._handle_gemini_event(event)
         finally:
             await self.close()
 

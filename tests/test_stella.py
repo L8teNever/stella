@@ -20,8 +20,10 @@ from stella.telnyx_client import TelnyxClient
 from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
 from stella.gemini_voice import (
     DEFAULT_GEMINI_LIVE_MODEL,
+    GEMINI_LIVE_SETUP_FALLBACKS,
     GeminiVoiceSession,
     gemini_generation_config,
+    gemini_live_try_order,
     gemini_model_name,
     gemini_realtime_input_config,
     gemini_uses_thinking_level,
@@ -987,7 +989,8 @@ def test_gemini_setup_includes_phone_vad(tmp_path):
     cfg = gemini_realtime_input_config(settings)
     assert cfg == vad
     assert payload["generationConfig"]["responseModalities"] == ["AUDIO"]
-    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
     assert "call hang_up" in payload["systemInstruction"]["parts"][0]["text"]
     assert "ich verstehe nicht" in payload["systemInstruction"]["parts"][0]["text"]
 
@@ -1004,6 +1007,7 @@ def test_instructions_german_when_brief_is_de(tmp_path):
     assert job_wants_german(job)
     text = build_instructions(job)
     assert "Speak German" in text
+    assert "ich verstehe nicht" in text
 
 
 @pytest.mark.asyncio
@@ -1089,7 +1093,8 @@ def test_gemini_setup_client_vad_disables_automatic(tmp_path):
     payload = session._setup_payload()
     aad = payload["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad == {"disabled": True}
-    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
 
 
 @pytest.mark.asyncio
@@ -1203,7 +1208,10 @@ def test_gemini_model_override_and_thinking_config(tmp_path):
     live = make_settings(tmp_path, gemini_live_model="gemini-3.8-live")
     assert gemini_model_name(live) == "models/gemini-3.8-live"
     assert gemini_uses_thinking_level("gemini-3.8-live")
-    assert gemini_generation_config(live)["thinkingConfig"] == {"thinkingLevel": "minimal"}
+    assert gemini_generation_config(live)["thinkingConfig"] == {
+        "thinkingLevel": "minimal",
+        "thinkingBudget": 0,
+    }
 
     pinned = make_settings(
         tmp_path,
@@ -1220,3 +1228,50 @@ def test_gemini_model_override_and_thinking_config(tmp_path):
 
     omit = make_settings(tmp_path, gemini_thinking_budget=-1)
     assert "thinkingConfig" not in gemini_generation_config(omit)
+
+    settings = make_settings(tmp_path)
+    order = gemini_live_try_order(settings)
+    assert order[0] == "gemini-3.8-live"
+    assert order[1:] == list(GEMINI_LIVE_SETUP_FALLBACKS)
+    assert "preview-09-2025" not in order
+    assert "extended-thinking" not in "".join(order)
+
+
+@pytest.mark.asyncio
+async def test_gemini_setup_falls_back_to_next_live_model(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    models: list[str] = []
+
+    async def gemini_connect(url, headers):
+        n = len(models)
+        if n == 0:
+            ws = FakeProviderWS([json.dumps({"error": {"message": "model unavailable"}})])
+        else:
+            ws = FakeProviderWS([json.dumps({"setupComplete": {}})])
+
+        orig_send = ws.send
+
+        async def send(data):
+            await orig_send(data)
+            msg = ws.sent[-1]
+            if isinstance(msg, dict) and "setup" in msg:
+                models.append(msg["setup"]["model"])
+
+        ws.send = send  # type: ignore[method-assign]
+        return ws
+
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=gemini_connect,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    await session.connect()
+    assert models[0] == "models/gemini-3.8-live"
+    assert models[1] == "models/gemini-3.1-flash-live-preview"
+    assert session._active_model == "gemini-3.1-flash-live-preview"
+    await session.close()

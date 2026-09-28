@@ -152,7 +152,9 @@ def build_instructions(job: CallJob) -> str:
     if job_wants_german(job):
         lang = (
             "Speak German unless the other party switches language. "
-            "Reply immediately; do not pause to 'think out loud'.\n"
+            "Short spoken replies only (one or two sentences). "
+            "Reply immediately; do not pause to 'think out loud'. "
+            "Never loop 'ich verstehe nicht' or ask to repeat unless they said nothing.\n"
         )
     ctx = job.context.strip() or "(none provided)"
     return (

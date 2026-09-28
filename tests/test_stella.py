@@ -16,7 +16,9 @@ from stella.jobs import JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
-from stella.voice import build_instructions
+from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
+from stella.gemini_voice import GeminiVoiceSession, gemini_model_name, gemini_ws_url
+from stella.voice import build_instructions, start_voice_bridge
 from stella.webhooks import verify_telnyx_signature
 from stella.xai_auth import XAIAuth
 
@@ -101,7 +103,16 @@ def test_place_call_fails_without_xai(tmp_path):
     svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()), XAIAuth(settings))
     with pytest.raises(StellaError) as ei:
         svc.place_call(to="+14155552671", brief="hello")
-    assert ei.value.code == "xai_auth_missing"
+    assert ei.value.code == "voice_auth_missing"
+    assert "GEMINI_API_KEY" in ei.value.message
+
+
+def test_place_call_allows_gemini_only(tmp_path):
+    settings = make_settings(tmp_path, xai_api_key="", gemini_api_key="test-gemini")
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()), XAIAuth(settings))
+    job = svc.place_call(to="+14155552671", brief="hello")
+    assert job.status == "dialing"
 
 
 def test_webhook_updates_status(tmp_path):
@@ -165,7 +176,12 @@ def test_health_and_call_http(tmp_path):
     client = TestClient(app)
     h = client.get("/health")
     assert h.status_code == 200
-    assert h.json()["xai_auth"] == "api_key"
+    body = h.json()
+    assert body["xai_auth"] == "api_key"
+    assert body["voice_provider"]["primary"] == "grok"
+    assert body["voice_provider"]["fallback"] == "gemini"
+    assert body["voice_provider"]["gemini"] == "none"
+    assert body["gemini_configured"] is False
     # webhook without skip would 500; skip is on
     r = client.post(
         "/webhooks/telnyx",
@@ -194,3 +210,243 @@ def test_ed25519_webhook_verify():
             signature_b64=base64.b64encode(sig).decode(),
             public_key_b64=base64.b64encode(pub).decode(),
         )
+
+
+class FakeProviderWS:
+    def __init__(self, messages: list[str] | None = None) -> None:
+        self.sent: list[Any] = []
+        self._messages = list(messages or [])
+        self.closed = False
+
+    async def send(self, data: str) -> None:
+        self.sent.append(json.loads(data) if isinstance(data, str) else data)
+
+    async def close(self) -> None:
+        self.closed = True
+        self._messages = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
+class FakeTelnyxWS:
+    def __init__(self, texts: list[str] | None = None) -> None:
+        self.sent: list[str] = []
+        self._texts = list(texts or [])
+
+    async def iter_text(self):
+        for t in self._texts:
+            yield t
+
+    async def send_text(self, data: str) -> None:
+        self.sent.append(data)
+
+
+@pytest.mark.asyncio
+async def test_start_voice_bridge_uses_grok_when_connect_works(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+    grok_ws = FakeProviderWS()
+    seen: list[str] = []
+
+    async def grok_connect(url, headers):
+        assert "api.x.ai" in url
+        assert headers["Authorization"].startswith("Bearer ")
+        return grok_ws
+
+    async def gemini_connect(url, headers):
+        raise AssertionError("Gemini should not be used")
+
+    provider = await start_voice_bridge(
+        settings=settings,
+        job=job,
+        telnyx_ws=FakeTelnyxWS(),
+        grok_token_fn=lambda: "tok",
+        grok_connect=grok_connect,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+        provider_cb=seen.append,
+        gemini_connect=gemini_connect,
+    )
+    assert provider == "grok"
+    assert seen == ["grok"]
+    assert grok_ws.sent[0]["type"] == "session.update"
+
+
+@pytest.mark.asyncio
+async def test_start_voice_bridge_falls_back_to_gemini_on_grok_403(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+    gemini_ws = FakeProviderWS([json.dumps({"setupComplete": {}})])
+    seen: list[str] = []
+
+    async def grok_connect(url, headers):
+        raise ConnectionError("HTTP 403 quota exceeded")
+
+    async def gemini_connect(url, headers):
+        assert "generativelanguage.googleapis.com" in url
+        assert "g-key" in url
+        return gemini_ws
+
+    async def hangup():
+        return None
+
+    provider = await start_voice_bridge(
+        settings=settings,
+        job=job,
+        telnyx_ws=FakeTelnyxWS(),
+        grok_token_fn=lambda: "tok",
+        grok_connect=grok_connect,
+        hangup_cb=hangup,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+        provider_cb=seen.append,
+        gemini_connect=gemini_connect,
+    )
+    assert provider == "gemini"
+    assert seen == ["gemini"]
+    assert gemini_ws.sent[0]["setup"]["model"].startswith("models/")
+
+
+@pytest.mark.asyncio
+async def test_start_voice_bridge_errors_when_gemini_key_missing(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+
+    async def grok_connect(url, headers):
+        raise ConnectionError("HTTP 403")
+
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        await start_voice_bridge(
+            settings=settings,
+            job=job,
+            telnyx_ws=FakeTelnyxWS(),
+            grok_token_fn=lambda: "tok",
+            grok_connect=grok_connect,
+            hangup_cb=lambda: None,
+            transcript_cb=lambda c: None,
+            outcome_cb=lambda t: None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_voice_bridge_errors_when_both_fail(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+
+    async def grok_connect(url, headers):
+        raise ConnectionError("HTTP 403")
+
+    async def gemini_connect(url, headers):
+        raise ConnectionError("gemini 401")
+
+    with pytest.raises(RuntimeError, match="Both voice providers failed"):
+        await start_voice_bridge(
+            settings=settings,
+            job=job,
+            telnyx_ws=FakeTelnyxWS(),
+            grok_token_fn=lambda: "tok",
+            grok_connect=grok_connect,
+            hangup_cb=lambda: None,
+            transcript_cb=lambda c: None,
+            outcome_cb=lambda t: None,
+            gemini_connect=gemini_connect,
+        )
+
+
+@pytest.mark.asyncio
+async def test_gemini_hang_up_and_audio_out(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+    telnyx = FakeTelnyxWS()
+    outcomes: list[str] = []
+    hung: list[bool] = []
+
+    async def hangup():
+        hung.append(True)
+
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=hangup,
+        transcript_cb=lambda c: None,
+        outcome_cb=outcomes.append,
+    )
+    session._telnyx_ws = telnyx
+    import audioop as _audioop
+
+    pcm24 = _audioop.lin2lin(b"\x00\x10" * 48, 2, 2)
+    payload = base64.b64encode(pcm24).decode("ascii")
+    await session._handle_gemini_event(
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "audio/pcm;rate=24000",
+                                "data": payload,
+                            }
+                        }
+                    ]
+                },
+                "outputTranscription": {"text": "hello"},
+            }
+        }
+    )
+    assert telnyx.sent
+    media = json.loads(telnyx.sent[0])
+    assert media["event"] == "media"
+
+    class DummyGemini:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(data)
+
+        async def close(self):
+            pass
+
+    session._gemini_ws = DummyGemini()
+    await session._handle_gemini_event(
+        {
+            "toolCall": {
+                "functionCalls": [
+                    {"id": "1", "name": "hang_up", "args": {"outcome": "Reserved."}}
+                ]
+            }
+        }
+    )
+    assert outcomes == ["Reserved."]
+    assert hung == [True]
+
+
+def test_pcmu_roundtrip_and_mime_rate():
+    assert parse_pcm_rate("audio/pcm;rate=24000", 16000) == 24000
+    up = Pcmu8kToPcm16k()
+    down = PcmToPcmu8k(default_rate=16000)
+    silence = base64.b64encode(b"\xff" * 160).decode("ascii")
+    pcm = up.convert_b64(silence)
+    assert len(pcm) >= 600 and len(pcm) % 2 == 0
+    back = down.convert_b64(base64.b64encode(pcm).decode("ascii"), "audio/pcm;rate=16000")
+    assert back
+
+
+def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="secret-key")
+    url = gemini_ws_url(settings)
+    assert "secret-key" in url
+    assert gemini_model_name(settings).startswith("models/")

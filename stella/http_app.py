@@ -13,7 +13,7 @@ from stella.jobs import JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
-from stella.voice import VoiceSession
+from stella.voice import start_voice_bridge
 from stella.webhooks import verify_telnyx_signature
 from stella.xai_auth import XAIAuth
 
@@ -49,6 +49,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ok": True,
             "service": "stella",
             "xai_auth": xai.auth_mode(),
+            "voice_provider": {
+                "primary": "grok",
+                "fallback": "gemini",
+                "grok": xai.auth_mode(),
+                "gemini": "api_key" if (settings.gemini_api_key or "").strip() else "none",
+            },
+            "gemini_configured": bool((settings.gemini_api_key or "").strip()),
             "telnyx_configured": bool(
                 settings.telnyx_api_key
                 and settings.telnyx_connection_id
@@ -152,33 +159,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def grok_connect(url: str, headers: dict):
             import websockets
 
-            return await websockets.connect(url, additional_headers=headers)
+            return await websockets.connect(url, additional_headers=headers or None)
+
+        def provider_cb(name: str) -> None:
+            store.update(job_id, voice_provider=name)
 
         try:
-            token = xai.bearer_token()
-        except StellaError as exc:
-            store.update(job_id, status="failed", error=exc.message)
-            await websocket.close(code=1011)
-            return
-
-        session = VoiceSession(
-            settings=settings,
-            job=job,
-            bearer_token=token,
-            grok_connect=grok_connect,
-            hangup_cb=hangup_cb,
-            transcript_cb=transcript_cb,
-            outcome_cb=outcome_cb,
-        )
-        try:
-            await session.attach_telnyx(websocket)
+            await start_voice_bridge(
+                settings=settings,
+                job=job,
+                telnyx_ws=websocket,
+                grok_token_fn=xai.bearer_token,
+                grok_connect=grok_connect,
+                hangup_cb=hangup_cb,
+                transcript_cb=transcript_cb,
+                outcome_cb=outcome_cb,
+                provider_cb=provider_cb,
+                gemini_connect=grok_connect,
+            )
         except WebSocketDisconnect:
             pass
-        except Exception:
+        except Exception as exc:
             logger.exception("media session failed for %s", job_id)
-            store.update(job_id, status="failed", error="voice session failed")
-        finally:
-            await session.close()
+            store.update(job_id, status="failed", error=str(exc)[:2000] or "voice session failed")
 
     @app.middleware("http")
     async def mcp_auth_middleware(request: Request, call_next):

@@ -23,6 +23,10 @@ from stella.voice import (
 
 logger = logging.getLogger(__name__)
 
+# https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live
+# Live WebSocket get-started uses this id with responseModalities AUDIO.
+DEFAULT_GEMINI_LIVE_MODEL = "gemini-3.8-live"
+
 
 def gemini_ws_url(settings: Settings) -> str:
     base = settings.gemini_realtime_url.rstrip("?")
@@ -30,13 +34,23 @@ def gemini_ws_url(settings: Settings) -> str:
     return f"{base}?{query}"
 
 
+def gemini_model_id(settings: Settings) -> str:
+    return (settings.gemini_live_model or "").strip() or DEFAULT_GEMINI_LIVE_MODEL
+
+
 def gemini_model_name(settings: Settings) -> str:
-    model = (settings.gemini_live_model or "").strip()
-    if not model:
-        model = "gemini-2.5-flash-native-audio-preview-09-2025"
+    model = gemini_model_id(settings)
     if not model.startswith("models/"):
         model = f"models/{model}"
     return model
+
+
+def gemini_uses_thinking_level(model: str) -> bool:
+    """Gemini 3.x Live uses thinkingLevel; 2.5 native-audio uses thinkingBudget."""
+    raw = model.lower().removeprefix("models/")
+    if raw.startswith("gemini-2.5"):
+        return False
+    return raw.startswith("gemini-3")
 
 
 def gemini_uses_client_vad(settings: Settings) -> bool:
@@ -78,7 +92,13 @@ def gemini_generation_config(settings: Settings) -> dict[str, Any]:
     }
     budget = int(settings.gemini_thinking_budget)
     if budget >= 0:
-        cfg["thinkingConfig"] = {"thinkingBudget": budget}
+        if gemini_uses_thinking_level(gemini_model_id(settings)):
+            # 3.x Live default is already minimal; send it explicitly for lowest TTFT.
+            cfg["thinkingConfig"] = {
+                "thinkingLevel": "minimal" if budget == 0 else "low"
+            }
+        else:
+            cfg["thinkingConfig"] = {"thinkingBudget": budget}
     return cfg
 
 

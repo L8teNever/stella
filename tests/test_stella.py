@@ -19,9 +19,12 @@ from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
 from stella.gemini_voice import (
+    DEFAULT_GEMINI_LIVE_MODEL,
     GeminiVoiceSession,
+    gemini_generation_config,
     gemini_model_name,
     gemini_realtime_input_config,
+    gemini_uses_thinking_level,
     gemini_ws_url,
 )
 from stella.voice import VoiceSession, build_instructions, job_wants_german, start_voice_bridge
@@ -208,6 +211,7 @@ def test_instructions_contain_only_job_context(tmp_path):
     assert "Not Ida" in text or "NOT Ida" in text
     assert "hang_up" in text
     assert "never narrate reasoning" in text.lower()
+    assert "ich verstehe nicht" in text.lower()
     assert "Speak German" not in text
     assert not job_wants_german(job)
 
@@ -660,7 +664,9 @@ def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):
     settings = make_settings(tmp_path, gemini_api_key="secret-key")
     url = gemini_ws_url(settings)
     assert "secret-key" in url
-    assert gemini_model_name(settings).startswith("models/")
+    assert gemini_model_name(settings) == f"models/{DEFAULT_GEMINI_LIVE_MODEL}"
+    assert DEFAULT_GEMINI_LIVE_MODEL == "gemini-3.8-live"
+    assert "preview-09-2025" not in DEFAULT_GEMINI_LIVE_MODEL
 
 
 def test_chooser_probes_grok_once_then_caches_403(tmp_path):
@@ -981,8 +987,9 @@ def test_gemini_setup_includes_phone_vad(tmp_path):
     cfg = gemini_realtime_input_config(settings)
     assert cfg == vad
     assert payload["generationConfig"]["responseModalities"] == ["AUDIO"]
-    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
     assert "call hang_up" in payload["systemInstruction"]["parts"][0]["text"]
+    assert "ich verstehe nicht" in payload["systemInstruction"]["parts"][0]["text"]
 
 
 def test_instructions_german_when_brief_is_de(tmp_path):
@@ -1082,7 +1089,7 @@ def test_gemini_setup_client_vad_disables_automatic(tmp_path):
     payload = session._setup_payload()
     aad = payload["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad == {"disabled": True}
-    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
 
 @pytest.mark.asyncio
@@ -1190,3 +1197,26 @@ def test_hang_up_tool_requires_action():
 
     desc = hang_up_tool_openai()["description"]
     assert "hang up" in desc.lower() or "End the live" in desc
+
+
+def test_gemini_model_override_and_thinking_config(tmp_path):
+    live = make_settings(tmp_path, gemini_live_model="gemini-3.8-live")
+    assert gemini_model_name(live) == "models/gemini-3.8-live"
+    assert gemini_uses_thinking_level("gemini-3.8-live")
+    assert gemini_generation_config(live)["thinkingConfig"] == {"thinkingLevel": "minimal"}
+
+    pinned = make_settings(
+        tmp_path,
+        gemini_live_model="gemini-2.5-flash-native-audio-preview-12-2025",
+    )
+    assert gemini_model_name(pinned) == (
+        "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    )
+    assert not gemini_uses_thinking_level(pinned.gemini_live_model)
+    assert gemini_generation_config(pinned)["thinkingConfig"] == {"thinkingBudget": 0}
+
+    empty = make_settings(tmp_path, gemini_live_model="")
+    assert gemini_model_name(empty) == f"models/{DEFAULT_GEMINI_LIVE_MODEL}"
+
+    omit = make_settings(tmp_path, gemini_thinking_budget=-1)
+    assert "thinkingConfig" not in gemini_generation_config(omit)

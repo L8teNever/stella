@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     xai_realtime_url: str = "wss://api.x.ai/v1/realtime"
 
     gemini_api_key: str = ""
-    gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-09-2025"
+    # Official Gemini Live native-audio id (BidiGenerateContent). Override with GEMINI_LIVE_MODEL.
+    gemini_live_model: str = "gemini-3.8-live"
     gemini_voice: str = "Aoede"
     gemini_realtime_url: str = (
         "wss://generativelanguage.googleapis.com/ws/"
@@ -47,7 +48,8 @@ class Settings(BaseSettings):
     gemini_vad_end_sensitivity: str = "END_SENSITIVITY_HIGH"
     gemini_vad_activity_handling: str = "START_OF_ACTIVITY_INTERRUPTS"
     gemini_vad_turn_coverage: str = "TURN_INCLUDES_ONLY_ACTIVITY"
-    # 0 disables Gemini 2.5 thinking tokens (lowest TTFT). Negative omits the field.
+    # Gemini 2.5 Live: 0 disables thinking tokens (lowest TTFT). Negative omits the field.
+    # Gemini 3.x Live: 0 maps to thinkingLevel=minimal; >0 maps to low; negative omits.
     gemini_thinking_budget: int = 0
     # Local RMS VAD → activityStart/activityEnd (disables automaticActivityDetection).
     stella_client_vad: bool = True

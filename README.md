@@ -82,13 +82,13 @@ Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants *
 
 If Grok cannot be used and `GEMINI_API_KEY` is empty, the job fails with an explicit error before dial (or the media session fails if only Gemini was locked).
 
-Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Aoede`, female). Grok remains `XAI_VOICE=eve`. `GEMINI_THINKING_BUDGET` defaults to `0` (disable 2.5 thinking tokens).
+Optional overrides: `GEMINI_LIVE_MODEL` (default `gemini-3.8-live`, Gemini Live native audio / BidiGenerateContent — see [Gemini 3.8 Live](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live)), `GEMINI_VOICE` (default `Aoede`, female). Grok remains `XAI_VOICE=eve`. `GEMINI_THINKING_BUDGET` defaults to `0`: on Gemini 2.5 Live that disables thinking tokens; on Gemini 3.x Live it sends `thinkingLevel=minimal` (lowest TTFT). Set `-1` to omit `thinkingConfig`.
 
 **Turn latency (Gemini):** By default Stella uses **client RMS VAD** (`STELLA_CLIENT_VAD=true`): inbound PCMU is energy-gated locally; after ~`STELLA_CLIENT_VAD_SILENCE_MS` (default 120) of quiet following speech, Stella sends `realtimeInput.activityEnd` and Gemini starts the reply without waiting for Google’s automatic end-of-speech (often ~1–2s+). Automatic VAD is disabled in that mode. Set `STELLA_CLIENT_VAD=false` to use Google’s detector (`GEMINI_VAD_SILENCE_DURATION_MS`, `GEMINI_VAD_START_SENSITIVITY` / `END_SENSITIVITY`, `GEMINI_VAD_PREFIX_PADDING_MS`). Barge-in still uses `START_OF_ACTIVITY_INTERRUPTS`; Telnyx `clear` is sent only on Gemini `interrupted`, not on every energy blip.
 
 `STELLA_LATENCY_LOG=true` logs `setup_to_first_audio_ms` and `silence_to_first_audio_ms` (activityEnd → first outbound PCMU). Remaining delay after activityEnd is Gemini first-audio TTFT (typically a few hundred ms to ~1s+); that floor is not fully removable in-app.
 
-If Google publishes a faster native-audio Live model, set `GEMINI_LIVE_MODEL` after verifying the Live WebSocket id — do not change the default blindly.
+To pin an older Live id (for example `gemini-3.1-flash-live-preview` or `gemini-2.5-flash-native-audio-preview-12-2025`), set `GEMINI_LIVE_MODEL` after verifying the WebSocket setup handshake. Do not use `gemini-3.8-live-extended-thinking` for PSTN — extra reasoning latency.
 
 **Hang-up:** The model must call `hang_up` to drop the PSTN leg (spoken “tschüss” is not enough). TelnyxMediaGuard still waits for stream start and outbound playout. A backup fires if the spoken transcript looks like a farewell and inbound stays quiet for `STELLA_FAREWELL_HANGUP_S` (disable with `STELLA_FAREWELL_HANGUP=false`).
 

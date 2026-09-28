@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
 from stella.config import Settings
 from stella.store import CallJob
-from stella.voice import KICKOFF_TEXT, build_instructions, hang_up_tool_openai
+from stella.voice import KICKOFF_TEXT, TelnyxMediaGuard, build_instructions, hang_up_tool_openai
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,8 @@ class GeminiVoiceSession:
         self._up = Pcmu8kToPcm16k()
         self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
         self.provider = "gemini"
+        self.guard = TelnyxMediaGuard()
+        self._setup_complete = asyncio.Event()
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -120,10 +122,16 @@ class GeminiVoiceSession:
         }
 
     async def run(self) -> None:
-        await asyncio.gather(self._pump_telnyx(), self._pump_gemini())
+        await asyncio.gather(
+            self._pump_telnyx(),
+            self._pump_gemini(),
+            self.guard.kickoff_once(lambda: self._closed, self._send_kickoff),
+        )
 
     async def _send_kickoff(self) -> None:
-        assert self._gemini_ws is not None
+        await self._setup_complete.wait()
+        if self._closed or self._gemini_ws is None:
+            return
         await self._gemini_ws.send(
             json.dumps(
                 {
@@ -151,6 +159,8 @@ class GeminiVoiceSession:
                 except json.JSONDecodeError:
                     continue
                 event = msg.get("event")
+                if event in {"start", "media"}:
+                    self.guard.mark_started()
                 if event == "media":
                     media = msg.get("media") or {}
                     track = (media.get("track") or "").lower()
@@ -180,7 +190,6 @@ class GeminiVoiceSession:
 
     async def _pump_gemini(self) -> None:
         assert self._gemini_ws is not None
-        kickoff_sent = False
         try:
             async for raw in self._gemini_ws:
                 if self._closed:
@@ -191,9 +200,8 @@ class GeminiVoiceSession:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if "setupComplete" in event and not kickoff_sent:
-                    kickoff_sent = True
-                    await self._send_kickoff()
+                if "setupComplete" in event:
+                    self._setup_complete.set()
                     continue
                 await self._handle_gemini_event(event)
         finally:
@@ -209,11 +217,9 @@ class GeminiVoiceSession:
             inline = part.get("inlineData") or {}
             data = inline.get("data")
             mime = inline.get("mimeType") or ""
-            if data and "audio" in mime.lower() and self._telnyx_ws:
+            if data and "audio" in mime.lower():
                 for payload in self._down.convert_frames_b64(data, mime):
-                    await self._telnyx_ws.send_text(
-                        json.dumps({"event": "media", "media": {"payload": payload}})
-                    )
+                    await self.guard.send_outbound_pcmu(self._telnyx_ws, payload)
             text = part.get("text")
             if text:
                 self._assistant_bits.append(text)
@@ -252,9 +258,17 @@ class GeminiVoiceSession:
                         }
                     )
                 )
-            await self._hangup()
-            await self.close()
+            self.guard.arm_hangup(self._deferred_hangup)
             return
+
+    async def _deferred_hangup(self) -> None:
+        try:
+            await self.guard.telnyx_started.wait()
+            for leftover in self._down.flush_frames_b64():
+                await self.guard.send_outbound_pcmu(self._telnyx_ws, leftover)
+            await self.guard.hangup_after_audio(self._hangup, lambda: self._closed)
+        finally:
+            await self.close()
 
     async def _send_telnyx_clear(self) -> None:
         if self._telnyx_ws:
@@ -267,6 +281,8 @@ class GeminiVoiceSession:
         if self._closed:
             return
         self._closed = True
+        self._setup_complete.set()
+        self.guard.mark_started()
         if self._gemini_ws is None:
             return
         try:

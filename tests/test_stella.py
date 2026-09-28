@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -18,8 +19,12 @@ from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
 from stella.gemini_voice import GeminiVoiceSession, gemini_model_name, gemini_ws_url
-from stella.voice import build_instructions, start_voice_bridge
-from stella.voice_provider import GROK_DOWN_CACHE_TTL_SECONDS, VoiceProviderChooser
+from stella.voice import VoiceSession, build_instructions, start_voice_bridge
+from stella.voice_provider import (
+    GROK_DOWN_CACHE_TTL_SECONDS,
+    VoiceProviderChooser,
+    default_grok_realtime_probe,
+)
 from stella.webhooks import verify_telnyx_signature
 from stella.xai_auth import XAIAuth
 
@@ -255,35 +260,46 @@ def test_ed25519_webhook_verify():
 
 
 class FakeProviderWS:
-    def __init__(self, messages: list[str] | None = None) -> None:
+    def __init__(self, messages: list[str] | None = None, *, hold_open: bool = False) -> None:
         self.sent: list[Any] = []
         self._messages = list(messages or [])
         self.closed = False
+        self._hold_open = hold_open
 
     async def send(self, data: str) -> None:
         self.sent.append(json.loads(data) if isinstance(data, str) else data)
 
     async def close(self) -> None:
         self.closed = True
+        self._hold_open = False
         self._messages = []
 
     def __aiter__(self):
         return self
 
     async def __anext__(self) -> str:
-        if not self._messages:
-            raise StopAsyncIteration
-        return self._messages.pop(0)
+        if self._messages:
+            return self._messages.pop(0)
+        if self._hold_open and not self.closed:
+            await asyncio.sleep(0.05)
+            if self._messages:
+                return self._messages.pop(0)
+            if self._hold_open and not self.closed:
+                await asyncio.sleep(0.05)
+        raise StopAsyncIteration
 
 
 class FakeTelnyxWS:
-    def __init__(self, texts: list[str] | None = None) -> None:
+    def __init__(self, texts: list[str] | None = None, *, linger_s: float = 0.0) -> None:
         self.sent: list[str] = []
         self._texts = list(texts or [])
+        self._linger_s = linger_s
 
     async def iter_text(self):
         for t in self._texts:
             yield t
+        if self._linger_s:
+            await asyncio.sleep(self._linger_s)
 
     async def send_text(self, data: str) -> None:
         self.sent.append(data)
@@ -503,6 +519,9 @@ async def test_gemini_hang_up_and_audio_out(tmp_path):
         outcome_cb=outcomes.append,
     )
     session._telnyx_ws = telnyx
+    session.guard.mark_started()
+    session.guard.hangup_playout_pad_s = 0.0
+    session.guard.hangup_wait_audio_s = 0.2
 
     pcm24 = b"\x00\x10" * 480  # 20 ms at 24 kHz, 16-bit LE
     payload = base64.b64encode(pcm24).decode("ascii")
@@ -550,6 +569,8 @@ async def test_gemini_hang_up_and_audio_out(tmp_path):
         }
     )
     assert outcomes == ["Reserved."]
+    assert session.guard._hangup_task is not None
+    await session.guard._hangup_task
     assert hung == [True]
 
 
@@ -688,3 +709,233 @@ def test_chooser_uses_grok_when_probe_ok(tmp_path):
     xai = XAIAuth(settings)
     chooser = VoiceProviderChooser(settings, xai, grok_probe=lambda t: None)
     assert chooser.choose() == "grok"
+
+
+class _FakeSyncWS:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_default_grok_probe_sync_and_running_loop(tmp_path, monkeypatch):
+    """MCP/FastAPI already has a loop; probe must not use asyncio.run()."""
+    settings = make_settings(tmp_path)
+    seen: list[str] = []
+
+    def fake_connect(url, **kwargs):
+        seen.append(url)
+        assert kwargs["additional_headers"]["Authorization"] == "Bearer tok"
+        return _FakeSyncWS()
+
+    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
+
+    default_grok_realtime_probe(settings, "tok")
+    assert seen
+
+    async def from_mcp():
+        default_grok_realtime_probe(settings, "tok")
+
+    asyncio.run(from_mcp())
+    assert len(seen) == 2
+
+
+def test_chooser_default_probe_from_async_does_not_mark_down(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    xai = XAIAuth(settings)
+    monkeypatch.setattr("websockets.sync.client.connect", lambda *a, **k: _FakeSyncWS())
+    chooser = VoiceProviderChooser(settings, xai)
+
+    async def mcp_place():
+        return chooser.choose()
+
+    assert asyncio.run(mcp_place()) == "grok"
+    assert chooser.grok_down_cached() is None
+
+
+@pytest.mark.asyncio
+async def test_gemini_drops_audio_and_defers_hangup_before_telnyx_start(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Sag Hallo.")
+    telnyx = FakeTelnyxWS()
+    hung: list[bool] = []
+
+    async def hangup():
+        hung.append(True)
+
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=hangup,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    session._telnyx_ws = telnyx
+    session.guard.hangup_wait_audio_s = 0.15
+    session.guard.hangup_playout_pad_s = 0.0
+
+    class DummyGemini:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(data)
+
+        async def close(self):
+            pass
+
+    session._gemini_ws = DummyGemini()
+    pcm24 = b"\x00\x10" * 480
+    payload = base64.b64encode(pcm24).decode("ascii")
+    await session._handle_gemini_event(
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": payload}}
+                    ]
+                }
+            }
+        }
+    )
+    assert telnyx.sent == []
+
+    await session._handle_gemini_event(
+        {
+            "toolCall": {
+                "functionCalls": [
+                    {"id": "1", "name": "hang_up", "args": {"outcome": "Test erfolgreich"}}
+                ]
+            }
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert hung == []
+    session.guard.mark_started()
+    await session._handle_gemini_event(
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": payload}}
+                    ]
+                }
+            }
+        }
+    )
+    assert telnyx.sent
+    assert session.guard._hangup_task is not None
+    await session.guard._hangup_task
+    assert hung == [True]
+
+
+@pytest.mark.asyncio
+async def test_gemini_kickoff_waits_for_stream_start(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hallo Simon")
+    gemini_ws = FakeProviderWS([json.dumps({"setupComplete": {}})], hold_open=True)
+    telnyx = FakeTelnyxWS(texts=[json.dumps({"event": "connected"})], linger_s=0.15)
+
+    async def gemini_connect(url, headers):
+        return gemini_ws
+
+    await start_voice_bridge(
+        settings=settings,
+        job=job,
+        telnyx_ws=telnyx,
+        grok_token_fn=lambda: "tok",
+        grok_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+        gemini_connect=gemini_connect,
+        locked_provider="gemini",
+    )
+    assert not any(isinstance(m, dict) and "clientContent" in m for m in gemini_ws.sent)
+
+
+@pytest.mark.asyncio
+async def test_gemini_kickoff_after_telnyx_start(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hallo Simon")
+    gemini_ws = FakeProviderWS([json.dumps({"setupComplete": {}})], hold_open=True)
+    telnyx = FakeTelnyxWS(
+        texts=[json.dumps({"event": "start", "start": {"mediaFormat": {}}})],
+        linger_s=0.15,
+    )
+
+    async def gemini_connect(url, headers):
+        return gemini_ws
+
+    await start_voice_bridge(
+        settings=settings,
+        job=job,
+        telnyx_ws=telnyx,
+        grok_token_fn=lambda: "tok",
+        grok_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+        gemini_connect=gemini_connect,
+        locked_provider="gemini",
+    )
+    assert any(isinstance(m, dict) and "clientContent" in m for m in gemini_ws.sent)
+
+
+@pytest.mark.asyncio
+async def test_grok_kickoff_after_telnyx_start(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
+    grok_ws = FakeProviderWS(hold_open=True)
+    telnyx = FakeTelnyxWS(texts=[json.dumps({"event": "start"})], linger_s=0.15)
+
+    async def grok_connect(url, headers):
+        return grok_ws
+
+    await start_voice_bridge(
+        settings=settings,
+        job=job,
+        telnyx_ws=telnyx,
+        grok_token_fn=lambda: "tok",
+        grok_connect=grok_connect,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+        locked_provider="grok",
+    )
+    types = [m.get("type") for m in grok_ws.sent if isinstance(m, dict)]
+    assert "session.update" in types
+    assert "conversation.item.create" in types
+    assert "response.create" in types
+
+
+@pytest.mark.asyncio
+async def test_voice_session_hangup_waits_for_outbound(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="x")
+    hung: list[int] = []
+
+    async def hangup():
+        hung.append(1)
+
+    session = VoiceSession(
+        settings=settings,
+        job=job,
+        bearer_token="t",
+        grok_connect=lambda u, h: None,
+        hangup_cb=hangup,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    session.guard.hangup_wait_audio_s = 0.2
+    session.guard.hangup_playout_pad_s = 0.0
+    session.guard.mark_started()
+    await session.guard.hangup_after_audio(hangup, lambda: False)
+    assert hung == [1]

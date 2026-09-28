@@ -16,7 +16,6 @@ shared across processes and is cleared when a Grok probe succeeds.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -39,25 +38,23 @@ def grok_realtime_url(settings: Settings) -> str:
 
 
 def default_grok_realtime_probe(settings: Settings, token: str) -> None:
-    """Open Grok Voice realtime WS and close it. Raises on handshake/connect failure."""
+    """Open Grok Voice realtime WS and close it. Raises on handshake/connect failure.
 
-    async def _once() -> None:
-        import websockets
+    Uses the **sync** websockets client so this is safe from MCP/FastAPI where an
+    event loop is already running. ``asyncio.run()`` would raise
+    ``cannot be called from a running event loop`` and falsely mark Grok down.
+    """
+    from websockets.sync.client import connect
 
-        url = grok_realtime_url(settings)
-        headers = {"Authorization": f"Bearer {token}"}
-        ws = await websockets.connect(
-            url,
-            additional_headers=headers,
-            open_timeout=8,
-            close_timeout=2,
-        )
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-    asyncio.run(_once())
+    url = grok_realtime_url(settings)
+    headers = {"Authorization": f"Bearer {token}"}
+    with connect(
+        url,
+        additional_headers=headers,
+        open_timeout=8,
+        close_timeout=2,
+    ):
+        return
 
 
 class VoiceProviderChooser:

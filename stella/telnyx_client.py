@@ -70,6 +70,8 @@ class TelnyxClient:
             "webhook_url": webhook_url,
             "webhook_url_method": "POST",
             "stream_url": stream_url,
+            # inbound_track = callee audio only. both_tracks would echo our
+            # outbound RTP back into the model and cause feedback / "swapped" audio.
             "stream_track": "inbound_track",
             "stream_bidirectional_mode": "rtp",
             "stream_bidirectional_codec": "PCMU",

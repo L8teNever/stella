@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-09-2025"
-    gemini_voice: str = "Puck"
+    gemini_voice: str = "Aoede"
     gemini_realtime_url: str = (
         "wss://generativelanguage.googleapis.com/ws/"
         "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"

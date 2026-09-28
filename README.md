@@ -76,11 +76,11 @@ Voice model default: `grok-voice-latest` (`XAI_VOICE_MODEL`). Voice: `XAI_VOICE=
 
 Grok remains the primary realtime path. On **session connect** failure (HTTP 403, auth, rate/limit, websocket errors, missing Grok credentials), Stella opens Gemini Live (`BidiGenerateContent`) for that call instead. MCP tools (`stella_call`, etc.) are unchanged.
 
-Telnyx streams **PCMU 8 kHz**. Gemini Live wants **PCM 16-bit / 16 kHz in** and typically **24 kHz PCM out**, so Stella resamples and μ-law-encodes on the bridge. That conversion adds latency and can degrade audio versus Grok’s native PCMU path. `GET /health` reports `voice_provider.primary/fallback` and whether `GEMINI_API_KEY` is set. After a media session connects, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
+Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants **PCM 16-bit LE / 16 kHz in** and typically **24 kHz PCM out**, so Stella box-filter downsamples, μ-law-encodes, and emits aligned 20 ms frames on the bridge. `GET /health` reports `voice_provider.primary/fallback` and whether `GEMINI_API_KEY` is set. After a media session connects, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
 
 If Grok fails and `GEMINI_API_KEY` is empty, the job fails with an explicit error. If both providers fail, the error includes both reasons.
 
-Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Puck`).
+Optional overrides: `GEMINI_LIVE_MODEL`, `GEMINI_VOICE` (default `Aoede`, female). Grok remains `XAI_VOICE=eve`.
 
 ## Telnyx
 

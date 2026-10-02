@@ -31,8 +31,10 @@ def build_mcp(service: JobService) -> FastMCP:
     ) -> dict[str, Any]:
         """Place an outbound call. `to` must be E.164. Stella only knows `brief` + `context`.
 
-        `allow_ida`: offer the live `frag_ida` lookup tool. Only ever honoured when `to`
-        is the configured owner number; leave unset for the default (on for the owner).
+        `allow_ida`: hand the call access to Ida's tools (live `frag_ida` look-ups/actions and
+        `aufgabe_planen`), so Simon can give follow-up tasks during the call. Only ever honoured
+        when `to` is the configured owner number; unset means on for the owner. Pass true for
+        reminder and callback calls.
         """
         try:
             job = service.place_call(

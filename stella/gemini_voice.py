@@ -72,11 +72,13 @@ def gemini_model_name(settings: Settings, model: str | None = None) -> str:
 
 
 def gemini_uses_thinking_level(model: str) -> bool:
-    """Gemini 3.x Live uses thinkingLevel; 2.5 native-audio uses thinkingBudget."""
+    """3.1 Live takes thinkingLevel; 3.8 and 2.5 native-audio take thinkingBudget.
+
+    The API rejects setup (close 1007) if both are set, and 3.8 rejects thinkingLevel
+    ("Thinking level is not supported for this model").
+    """
     raw = gemini_bare_model_id(model).lower()
-    if raw.startswith("gemini-2.5"):
-        return False
-    return raw.startswith("gemini-3")
+    return raw.startswith("gemini-3") and not raw.startswith("gemini-3.8")
 
 
 def gemini_uses_client_vad(settings: Settings) -> bool:
@@ -122,8 +124,7 @@ def gemini_generation_config(
     if budget >= 0:
         mid = model if model is not None else gemini_model_id(settings)
         if gemini_uses_thinking_level(mid):
-            # 3.x Live: thinkingLevel only. The API rejects setup (close 1007) when
-            # thinkingLevel and thinkingBudget are both set.
+            # 3.1 Live: thinkingLevel only (never together with thinkingBudget).
             cfg["thinkingConfig"] = {"thinkingLevel": "minimal" if budget == 0 else "low"}
         else:
             cfg["thinkingConfig"] = {"thinkingBudget": budget}

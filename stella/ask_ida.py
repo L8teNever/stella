@@ -80,7 +80,7 @@ def build_system_prompt(confirmed: bool, now: datetime | None = None) -> str:
         f"Heute ist {now:%A, %d.%m.%Y}, es ist {now:%H:%M} Uhr (Zeitzone Europe/Berlin). "
         "Du beantwortest eine Frage, die Simon am Telefon gestellt hat, mit den dir "
         "bereitgestellten Tools (Kalender, Stundenplan, Hausaufgaben, Mails, Smart Home). "
-        "Antworte auf Deutsch in 1 bis 3 kurzen Sätzen, die gesprochen werden: kein Markdown, "
+        "Antworte auf Deutsch, locker und umgangssprachlich wie unter Freunden (Simon wird geduzt, nichts Förmliches), in 1 bis 3 kurzen Sätzen, die gesprochen werden: kein Markdown, "
         "keine Listen, keine URLs, keine Emojis. Uhrzeiten immer als genaue "
         'Uhrzeit sagen ("dreizehn Uhr fünfundvierzig", "acht Uhr dreißig"), niemals "Viertel vor", '
         '"halb", "Viertel nach" oder "kurz vor"; Daten sprechbar. Komm direkt zum Punkt, ohne Einleitung. Wenn nichts gefunden wurde, sag genau das. '

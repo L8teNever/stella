@@ -990,3 +990,15 @@ async def test_hangup_guard_waits_for_outbound():
     guard.mark_started()
     await guard.hangup_after_audio(hangup, lambda: False)
     assert hung == [1]
+
+
+def test_mcp_token_protects_mcp_and_calls(tmp_path):
+    settings = make_settings(tmp_path, stella_mcp_token="s3cret")
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(settings))
+    assert client.get("/health").status_code == 200
+    assert client.get("/calls/x").status_code == 401
+    assert client.get("/calls/x?Token=wrong").status_code == 401
+    assert client.get("/calls/x?Token=s3cret").status_code == 404
+    assert client.get("/calls/x", headers={"Authorization": "Bearer s3cret"}).status_code == 404

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -17,6 +18,18 @@ from stella.voice import start_voice_bridge
 from stella.webhooks import verify_telnyx_signature
 
 logger = logging.getLogger("stella")
+
+
+def _token_ok(request: Request, expected: str) -> bool:
+    if not expected:
+        return True
+    auth = request.headers.get("authorization") or ""
+    bearer = f"Bearer {expected}"
+    q = request.query_params.get("Token") or request.query_params.get("token") or ""
+    try:
+        return secrets.compare_digest(auth, bearer) or secrets.compare_digest(q, expected)
+    except ValueError:
+        return False
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -138,12 +151,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.update(job_id, status="failed", error=str(exc)[:2000] or "voice session failed")
 
     @app.middleware("http")
-    async def mcp_auth_middleware(request: Request, call_next):
-        if request.url.path.startswith("/mcp") and settings.stella_mcp_token:
-            auth = request.headers.get("authorization") or ""
-            expected = f"Bearer {settings.stella_mcp_token}"
-            if auth != expected:
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async def normalize_mcp_case(request: Request, call_next):
+        path = request.scope.get("path") or ""
+        if path.startswith("/MCP"):
+            request.scope["path"] = "/mcp" + path[4:]
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def admin_auth_middleware(request: Request, call_next):
+        path = (request.scope.get("path") or "").lower()
+        needs = path.startswith("/mcp") or path.startswith("/calls")
+        if needs and settings.stella_mcp_token and not _token_ok(request, settings.stella_mcp_token):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
     app.mount("/mcp", mcp_asgi)

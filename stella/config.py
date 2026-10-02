@@ -71,6 +71,11 @@ class Settings(BaseSettings):
         "mcp__Ida_SSH,mcp__Ida_Cloudflare,mcp__*__*_loeschen,mcp__*__*delete*,"
         "mcp__*__google_mail_papierkorb,mcp__*__google_sheet_bereich_leeren"
     )
+    # Shared style rules for all AIs, read from Ida Memory (entity of that name, via MCP).
+    master_prompt_enabled: bool = True
+    master_prompt_entity: str = "Master-Prompt"
+    master_prompt_server: str = "Ida_Memory"  # key in ASK_IDA_MCP_CONFIG
+    master_prompt_refresh_s: float = 60.0
     # frag_ida is offered only on calls to this E.164 number.
     stella_owner_number: str = ""
     # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.

@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from stella.config import Settings, get_settings
 from stella.errors import StellaError
+from stella import master_prompt
 from stella.jobs import JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
@@ -54,12 +55,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     logger.exception("scheduler tick failed")
                 await asyncio.sleep(10)
 
+        async def master_prompt_loop() -> None:
+            while True:
+                await master_prompt.refresh(settings)
+                await asyncio.sleep(max(10.0, settings.master_prompt_refresh_s))
+
         task = asyncio.create_task(scheduler())
+        mp_task = asyncio.create_task(master_prompt_loop())
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
             task.cancel()
+            mp_task.cancel()
 
     app = FastAPI(title="Stella", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings

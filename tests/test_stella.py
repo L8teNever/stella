@@ -1426,3 +1426,55 @@ async def test_gemini_rueckruf_planen_tool(tmp_path):
         transcript_cb=lambda c: None, outcome_cb=lambda t: None,
     )
     assert "rueckruf_planen" not in str(plain._setup_payload()["tools"])
+
+
+# --- master prompt (shared rules from Ida Memory) -----------------------------
+
+from stella import master_prompt  # noqa: E402
+
+
+def test_master_prompt_parse_and_use(tmp_path):
+    payload = {"entities": [{"name": "Master-Prompt", "observations": [
+        "ZWECK: meta", "FORM: meta", "SPRACHE: Locker per du.", "UHRZEITEN: Genau nennen."]}]}
+    assert master_prompt.parse_entity(payload, "Master-Prompt") == (
+        "- SPRACHE: Locker per du.\n- UHRZEITEN: Genau nennen."
+    )
+    assert master_prompt.parse_entity(json.dumps(payload), "Master-Prompt")
+    assert master_prompt.parse_entity(payload, "Other") is None
+    assert master_prompt.parse_entity("not json", "x") is None
+
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="b")
+    try:
+        master_prompt.set_text(None)
+        assert "female JARVIS" in build_instructions(job)  # built-in default style
+        master_prompt.set_text(master_prompt.parse_entity(payload, "Master-Prompt"))
+        text = build_instructions(job)
+        assert "SPRACHE: Locker per du." in text and "female JARVIS" not in text
+        assert "hang_up" in text  # technical rules always stay
+        assert "SPRACHE: Locker per du." in ask_ida_mod.build_system_prompt(False)
+    finally:
+        master_prompt.set_text(None)
+
+
+@pytest.mark.asyncio
+async def test_master_prompt_refresh_keeps_last_good_on_error(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+
+    async def ok(_s):
+        return "- eins"
+
+    async def boom(_s):
+        raise RuntimeError("down")
+
+    try:
+        master_prompt.set_text(None)
+        monkeypatch.setattr(master_prompt, "fetch", ok)
+        assert await master_prompt.refresh(settings) is True
+        monkeypatch.setattr(master_prompt, "fetch", boom)
+        assert await master_prompt.refresh(settings) is False
+        assert master_prompt.current() == "- eins"
+        assert await master_prompt.refresh(make_settings(tmp_path, master_prompt_enabled=False)) is False
+    finally:
+        master_prompt.set_text(None)

@@ -44,14 +44,26 @@ def build_request(plan: dict[str, Any]) -> str:
         "etwas braucht; weitere Wünsche von ihm führst du mit frag_ida aus, bevor du auflegst.'); "
         "Nachrichten an Simon über Telegram (nachricht_senden); "
         "alles andere mit den passenden Tools. Danach diese Erinnerung leeren.' "
+        "Prüfe vorher mit erinnerungen_liste, ob es für diesen Zeitpunkt schon eine Erinnerung mit "
+        "derselben Aufgabe gibt; dann lege nichts neu an und antworte ERLEDIGT. "
         "Sind alle Plätze belegt, nutze keinen belegten Platz und melde einen Fehler. "
         "Antworte nur mit dem einen Wort ERLEDIGT, wenn die Erinnerung angelegt ist, sonst mit "
         "FEHLER und einem kurzen Grund."
     )
 
 
+def classify(answer: str) -> str:
+    """'ok', 'retry' (clear failure, safe to retry) or 'unknown' (do not retry: may be booked)."""
+    upper = (answer or "").upper()
+    if "FEHLER" in upper or answer in _FAILURES or not upper.strip():
+        return "retry"
+    if "ERLED" in upper:  # also tolerates truncated replies like "ERLED"
+        return "ok"
+    return "unknown"
+
+
 async def run(settings: Settings, plan: dict[str, Any]) -> bool:
-    """Book via Claude + Ida Reminder (one retry). Returns True if the reminder was created."""
+    """Book via Claude + Ida Reminder. Retries once, only on a clear failure."""
     for attempt in (1, 2):
         answer = ""
         try:
@@ -60,10 +72,13 @@ async def run(settings: Settings, plan: dict[str, Any]) -> bool:
             )
         except Exception:  # noqa: BLE001
             logger.exception("background task booking via Claude crashed")
-        upper = answer.upper()
-        if "ERLEDIGT" in upper and "FEHLER" not in upper and answer not in _FAILURES:
+        verdict = classify(answer)
+        if verdict == "ok":
             logger.info("task booked via Ida Reminder for %s", plan["run_at"].isoformat())
             return True
+        if verdict == "unknown":
+            logger.warning("task booking unclear (not retrying to avoid duplicates): %s", answer[:200])
+            return False
         logger.warning("task booking attempt %d failed: %s", attempt, answer[:200])
     logger.error("task for %s could NOT be booked", plan["run_at"].isoformat())
     return False

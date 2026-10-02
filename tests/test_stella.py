@@ -1554,3 +1554,16 @@ async def test_aufgabe_planen_carries_conversation_context(tmp_path):
     request = callback_bg.build_request(plans[0])
     assert "Gesprächskontext" in request and "Mathe-Hausaufgabe bis Montag" in request
     assert "context = der Gesprächskontext" in request
+
+
+def test_callback_classify_answers():
+    assert callback_bg.classify("ERLEDIGT") == "ok"
+    assert callback_bg.classify("ERLED") == "ok"
+    assert callback_bg.classify("Erledigt.") == "ok"
+    assert callback_bg.classify("FEHLER: alle Plätze belegt") == "retry"
+    assert callback_bg.classify(ask_ida_mod.MSG_TIMEOUT) == "retry"
+    assert callback_bg.classify("") == "retry"
+    assert callback_bg.classify("Hab's eingetragen") == "unknown"
+    req = callback_bg.build_request({"run_at": datetime.now(BERLIN) + timedelta(hours=1),
+                                     "aufgabe": "x", "to": OWNER, "speak_to": "Simon"})
+    assert "erinnerungen_liste" in req

@@ -1266,3 +1266,27 @@ def test_old_db_without_allow_ida_column_loads(tmp_path):
     old = store.get("old1")
     assert old.voice_provider == "grok" and old.allow_ida is False
     assert store.create(kind="call", to_number="+492", brief="b", allow_ida=True).allow_ida is True
+
+
+@pytest.mark.asyncio
+async def test_hangup_waits_only_for_queued_audio_not_whole_call():
+    """After a long call, hang_up must not wait for the cumulative audio length."""
+    slept: list[float] = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    guard = TelnyxMediaGuard(hangup_playout_pad_s=0.35, sleep=fake_sleep)
+    guard.mark_started()
+    frame = base64.b64encode(b"\xff" * 160).decode()  # 20 ms
+    ws = FakeTelnyxWS()
+    for _ in range(1500):  # 30 s of audio sent over the call
+        await guard.send_outbound_pcmu(ws, frame)
+    guard._play_end = 0.0  # ...which has long since finished playing
+    guard._play_end = __import__("time").monotonic() + 0.2  # 200 ms still queued
+    hung: list[int] = []
+    await guard.hangup_after_audio(lambda: hung.append(1), lambda: False)
+    assert hung == [1]
+    assert slept and slept[-1] <= 0.2 + 0.35 + 0.01
+    guard.clear_playout()
+    assert guard.remaining_playout_s() == 0.0

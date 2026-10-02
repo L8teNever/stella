@@ -547,6 +547,7 @@ class GeminiVoiceSession:
         await self._send_telnyx_clear()
 
     async def _send_telnyx_clear(self) -> None:
+        self.guard.clear_playout()
         if self._telnyx_ws:
             try:
                 await self._telnyx_ws.send_text(json.dumps({"event": "clear"}))

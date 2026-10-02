@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Any, Callable
 
 from stella.config import Settings
@@ -46,6 +47,8 @@ class TelnyxMediaGuard:
         self.telnyx_started = asyncio.Event()
         self.kickoff_sent = False
         self.outbound_ms = 0
+        # Monotonic time at which everything queued to Telnyx will have finished playing.
+        self._play_end = 0.0
         self.hangup_wait_audio_s = hangup_wait_audio_s
         self.hangup_playout_pad_s = hangup_playout_pad_s
         self._kickoff_lock = asyncio.Lock()
@@ -68,8 +71,17 @@ class TelnyxMediaGuard:
             logger.info("Dropping outbound PCMU until Telnyx stream start")
             return False
         await telnyx_ws.send_text(json.dumps({"event": "media", "media": {"payload": payload}}))
-        self.outbound_ms += pcmu_payload_duration_ms(payload)
+        dur_ms = pcmu_payload_duration_ms(payload)
+        self.outbound_ms += dur_ms
+        self._play_end = max(self._play_end, time.monotonic()) + dur_ms / 1000.0
         return True
+
+    def clear_playout(self) -> None:
+        """Telnyx `clear` flushed its queue: nothing is left to play out."""
+        self._play_end = 0.0
+
+    def remaining_playout_s(self) -> float:
+        return max(0.0, self._play_end - time.monotonic())
 
     async def kickoff_once(self, closed: Callable[[], bool], send_kickoff) -> None:
         async with self._kickoff_lock:
@@ -94,8 +106,9 @@ class TelnyxMediaGuard:
                 break
             await self._sleep(min(0.05, remaining))
         if self.outbound_ms > 0:
+            # Only wait for audio that is still queued, not for the whole call's audio.
             wait_s = min(
-                self.outbound_ms / 1000.0 + self.hangup_playout_pad_s,
+                self.remaining_playout_s() + self.hangup_playout_pad_s,
                 HANGUP_PLAYOUT_CAP_S,
             )
             await self._sleep(wait_s)

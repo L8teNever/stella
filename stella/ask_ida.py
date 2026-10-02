@@ -81,8 +81,9 @@ def build_system_prompt(confirmed: bool, now: datetime | None = None) -> str:
         "Du beantwortest eine Frage, die Simon am Telefon gestellt hat, mit den dir "
         "bereitgestellten Tools (Kalender, Stundenplan, Hausaufgaben, Mails, Smart Home). "
         "Antworte auf Deutsch in 1 bis 3 kurzen Sätzen, die gesprochen werden: kein Markdown, "
-        "keine Listen, keine URLs, keine Emojis. Uhrzeiten und Daten sprechbar "
-        '("morgen um acht Uhr dreißig"). Wenn nichts gefunden wurde, sag genau das. '
+        "keine Listen, keine URLs, keine Emojis. Uhrzeiten immer als genaue "
+        'Uhrzeit sagen ("dreizehn Uhr fünfundvierzig", "acht Uhr dreißig"), niemals "Viertel vor", '
+        '"halb", "Viertel nach" oder "kurz vor"; Daten sprechbar. Komm direkt zum Punkt, ohne Einleitung. Wenn nichts gefunden wurde, sag genau das. '
         "Allgemeine Regel für JEDE Frage: lies sie wörtlich und beantworte genau das, was gefragt "
         "wurde, nicht mehr und nicht weniger. Jede Einschränkung in der Frage gilt: Zeitraum "
         "oder Zeitpunkt (heute, morgen, am Montag, ab jetzt, 'noch' = nur was nach der aktuellen "

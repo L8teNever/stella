@@ -895,6 +895,10 @@ def test_looks_like_farewell():
     assert looks_like_farewell("Ok, tschüss!")
     assert looks_like_farewell("Goodbye")
     assert not looks_like_farewell("What time works for you?")
+    for phrase in ("Bis bald, pass auf dich auf!", "Das war's, bis später!", "Mach's gut!",
+                   "Wir hören voneinander", "Alles klar, bis zum nächsten Mal!"):
+        assert looks_like_farewell(phrase), phrase
+    assert not looks_like_farewell("Du hast bis dann Zeit für die Hausaufgabe.")
 
 
 def test_hang_up_tool_requires_action():

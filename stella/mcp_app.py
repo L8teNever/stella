@@ -5,7 +5,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from stella.errors import StellaError
-from stella.jobs import JobService, parse_run_at
+from stella.jobs import JobService
 
 
 def build_mcp(service: JobService) -> FastMCP:
@@ -80,36 +80,5 @@ def build_mcp(service: JobService) -> FastMCP:
             return job.to_public_dict()
         except StellaError as exc:
             return exc.to_dict()
-
-    @mcp.tool()
-    def stella_schedule_call(
-        to: str,
-        brief: str,
-        at: str = "",
-        in_minutes: int | None = None,
-        context: str = "",
-        speak_to: str = "",
-        allow_ida: bool | None = None,
-    ) -> dict[str, Any]:
-        """Schedule a call. `at` is HH:MM (24h, Europe/Berlin, today) or an ISO datetime;
-        alternatively `in_minutes`. Runs automatically at that time (up to 14 days ahead)."""
-        try:
-            run_at = parse_run_at(uhrzeit=at, in_minuten=in_minutes)
-            return service.schedule_call(
-                to=to, brief=brief, run_at=run_at, context=context, speak_to=speak_to,
-                allow_ida=allow_ida,
-            )
-        except StellaError as exc:
-            return exc.to_dict()
-
-    @mcp.tool()
-    def stella_scheduled_calls() -> dict[str, Any]:
-        """List pending scheduled calls."""
-        return {"scheduled": service.store.list_scheduled("pending")}
-
-    @mcp.tool()
-    def stella_cancel_scheduled_call(schedule_id: str) -> dict[str, Any]:
-        """Cancel a pending scheduled call by its id."""
-        return {"cancelled": service.store.cancel_scheduled(schedule_id)}
 
     return mcp

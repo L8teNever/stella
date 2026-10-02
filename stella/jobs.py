@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 MAX_SCHEDULE_AHEAD = timedelta(days=14)
-SCHEDULE_GRACE = timedelta(minutes=10)  # still run if the process was down at the due time
 _HHMM = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:uhr)?\s*$", re.IGNORECASE)
 
 
@@ -128,29 +127,6 @@ class JobService:
         )
         return self.store.get(job.id)  # type: ignore[return-value]
 
-    def schedule_call(
-        self,
-        *,
-        to: str,
-        brief: str,
-        run_at: datetime,
-        context: str = "",
-        speak_to: str = "",
-        kind: str = "call",
-        allow_ida: bool | None = None,
-    ) -> dict[str, Any]:
-        to_e164 = normalize_e164(to)
-        if not (brief or "").strip():
-            raise StellaError("Missing `brief` (task / script context).", "invalid_brief")
-        if not (self.settings.gemini_api_key or "").strip():
-            raise StellaError("GEMINI_API_KEY is not set; cannot schedule calls.", "gemini_key_missing")
-        row = self.store.schedule_call(
-            run_at=run_at, to_number=to_e164, brief=brief.strip(), context=(context or "").strip(),
-            speak_to=(speak_to or "").strip(), kind=kind, allow_ida=allow_ida,
-        )
-        row["run_at_local"] = run_at.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M")
-        return row
-
     def plan_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
         """Validate a spoken callback request (raises StellaError) without storing anything."""
         run_at = parse_run_at(
@@ -169,43 +145,6 @@ class JobService:
             "run_at": run_at, "grund": grund, "brief": brief, "to": job.to_number,
             "speak_to": job.speak_to or "Simon", "allow_ida": job.allow_ida,
         }
-
-    def schedule_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
-        """Internal scheduler path: store the callback in Stella's own DB."""
-        plan = self.plan_callback(job, args)
-        row = self.schedule_call(
-            to=plan["to"], brief=plan["brief"], run_at=plan["run_at"],
-            speak_to=plan["speak_to"], allow_ida=plan["allow_ida"],
-        )
-        run_at = plan["run_at"].astimezone(BERLIN)
-        return {"result": f"Rückruf geplant für {run_at:%H:%M} Uhr am {run_at:%d.%m.%Y}",
-                "id": row["id"]}
-
-    def run_due(self, now: datetime | None = None) -> int:
-        """Place calls whose time has come. Called every few seconds by the scheduler."""
-        now = now or datetime.now(timezone.utc)
-        ran = 0
-        for row in self.store.claim_due(now):
-            due = datetime.fromisoformat(row["run_at"])
-            if now - due > SCHEDULE_GRACE:
-                self.store.finish_scheduled(row["id"], status="missed", error="process was down")
-                logger.warning("scheduled call %s missed (due %s)", row["id"], row["run_at"])
-                continue
-            try:
-                job = self.place_call(
-                    to=row["to_number"], brief=row["brief"], context=row["context"],
-                    speak_to=row["speak_to"], kind=row["kind"],
-                    allow_ida=None if row["allow_ida"] is None else bool(row["allow_ida"]),
-                )
-                self.store.finish_scheduled(row["id"], status="done", job_id=job.id)
-                ran += 1
-            except StellaError as exc:
-                self.store.finish_scheduled(row["id"], status="failed", error=exc.message)
-                logger.warning("scheduled call %s failed: %s", row["id"], exc.message)
-            except Exception as exc:  # noqa: BLE001
-                self.store.finish_scheduled(row["id"], status="failed", error=str(exc))
-                logger.exception("scheduled call %s crashed", row["id"])
-        return ran
 
     def status(self, call_id: str) -> CallJob:
         job = self.store.get(call_id)

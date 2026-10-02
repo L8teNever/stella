@@ -2,8 +2,8 @@
 
 The voice agent confirms a callback instantly (foreground); the real work runs here as a
 detached task that keeps going after the call ended. Claude Code (with the Ida MCP servers)
-creates an Ida Reminder so that Ida calls Simon back via Stella at the requested time. If that
-fails or times out, Stella's own scheduler books the callback instead, so it never gets lost.
+creates an Ida Reminder so that Ida calls Simon back via Stella at the requested time. There is
+no internal scheduler: Ida Reminder is the only place callbacks live.
 """
 
 from __future__ import annotations
@@ -14,8 +14,7 @@ from typing import Any
 
 from stella import ask_ida as ask_ida_mod
 from stella.config import Settings
-from stella.errors import StellaError
-from stella.jobs import BERLIN, JobService
+from stella.jobs import BERLIN
 
 logger = logging.getLogger(__name__)
 
@@ -39,34 +38,28 @@ def build_request(plan: dict[str, Any]) -> str:
     )
 
 
-async def run(settings: Settings, jobs: JobService, plan: dict[str, Any]) -> bool:
-    """Book via Claude + Ida Reminder; fall back to Stella's scheduler. Returns True if booked."""
-    answer = ""
-    try:
-        answer = await ask_ida_mod.ask_ida(
-            settings, build_request(plan), timeout_s=BACKGROUND_TIMEOUT_S
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("background callback via Claude crashed")
-    ok = "ERLEDIGT" in answer.upper() and "FEHLER" not in answer.upper() and answer not in _FAILURES
-    if ok:
-        logger.info("callback booked via Ida Reminder for %s", plan["run_at"].isoformat())
-        return True
-    logger.warning("callback via Ida Reminder failed (%s); using Stella scheduler", answer[:200])
-    try:
-        jobs.schedule_call(
-            to=plan["to"], brief=plan["brief"], run_at=plan["run_at"],
-            speak_to=plan["speak_to"], allow_ida=plan["allow_ida"],
-        )
-        return True
-    except StellaError as exc:
-        logger.error("fallback scheduling failed: %s", exc.message)
-        return False
+async def run(settings: Settings, plan: dict[str, Any]) -> bool:
+    """Book via Claude + Ida Reminder (one retry). Returns True if the reminder was created."""
+    for attempt in (1, 2):
+        answer = ""
+        try:
+            answer = await ask_ida_mod.ask_ida(
+                settings, build_request(plan), timeout_s=BACKGROUND_TIMEOUT_S
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("background callback via Claude crashed")
+        upper = answer.upper()
+        if "ERLEDIGT" in upper and "FEHLER" not in upper and answer not in _FAILURES:
+            logger.info("callback booked via Ida Reminder for %s", plan["run_at"].isoformat())
+            return True
+        logger.warning("callback booking attempt %d failed: %s", attempt, answer[:200])
+    logger.error("callback for %s could NOT be booked", plan["run_at"].isoformat())
+    return False
 
 
-def start(settings: Settings, jobs: JobService, plan: dict[str, Any]) -> asyncio.Task:
+def start(settings: Settings, plan: dict[str, Any]) -> asyncio.Task:
     """Spawn the detached task (survives the end of the phone call)."""
-    task = asyncio.create_task(run(settings, jobs, plan))
+    task = asyncio.create_task(run(settings, plan))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return task

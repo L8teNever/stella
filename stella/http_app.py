@@ -47,26 +47,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         logging.basicConfig(level=logging.INFO)
 
-        async def scheduler() -> None:
-            while True:
-                try:
-                    await asyncio.to_thread(jobs.run_due)
-                except Exception:
-                    logger.exception("scheduler tick failed")
-                await asyncio.sleep(10)
-
         async def master_prompt_loop() -> None:
             while True:
                 await master_prompt.refresh(settings)
                 await asyncio.sleep(max(10.0, settings.master_prompt_refresh_s))
 
-        task = asyncio.create_task(scheduler())
         mp_task = asyncio.create_task(master_prompt_loop())
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
-            task.cancel()
             mp_task.cancel()
 
     app = FastAPI(title="Stella", version="0.1.0", lifespan=lifespan)
@@ -159,7 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def schedule_cb(args: dict) -> dict:
             # Validate now (so a past time is corrected in the call), book in the background.
             plan = jobs.plan_callback(job, args)
-            callback_bg.start(settings, jobs, plan)
+            callback_bg.start(settings, plan)
             run_at = plan["run_at"].astimezone(BERLIN)
             return {"result": f"Okay, der Rückruf für {run_at:%H:%M} Uhr wird im Hintergrund "
                     "eingerichtet. Bestätige Simon die Uhrzeit sofort."}

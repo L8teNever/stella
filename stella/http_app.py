@@ -148,10 +148,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def schedule_cb(args: dict) -> dict:
             # Validate now (so a past time is corrected in the call), book in the background.
-            plan = jobs.plan_callback(job, args)
+            plan = jobs.plan_task(job, args)
             callback_bg.start(settings, plan)
             run_at = plan["run_at"].astimezone(BERLIN)
-            return {"result": f"Okay, der Rückruf für {run_at:%H:%M} Uhr wird im Hintergrund "
+            return {"result": f"Okay, die Aufgabe für {run_at:%H:%M} Uhr wird im Hintergrund "
                     "eingerichtet. Bestätige Simon die Uhrzeit sofort."}
 
         try:

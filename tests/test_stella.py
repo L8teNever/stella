@@ -1417,18 +1417,8 @@ async def test_master_prompt_refresh_keeps_last_good_on_error(tmp_path, monkeypa
 from stella import callback_bg  # noqa: E402
 
 
-def _plan(svc, job, hhmm):
-    return svc.plan_callback(job, {"uhrzeit": hhmm, "grund": "Test"})
-
-
-
-
-
-
-
-
 @pytest.mark.asyncio
-async def test_rueckruf_planen_validates_then_books_only_in_background(tmp_path, monkeypatch):
+async def test_aufgabe_planen_validates_then_books_only_in_background(tmp_path, monkeypatch):
     settings = ida_settings(tmp_path)
     store = JobStore(settings.stella_db_path)
     svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
@@ -1445,7 +1435,7 @@ async def test_rueckruf_planen_validates_then_books_only_in_background(tmp_path,
     monkeypatch.setattr(callback_bg.ask_ida_mod, "ask_ida", fake_ask)
 
     def schedule_cb(args):
-        plan = svc.plan_callback(job, args)  # raises StellaError for past/invalid times
+        plan = svc.plan_task(job, args)  # raises StellaError for past/invalid times
         callback_bg.start(settings, plan)
         return {"result": "ok"}
 
@@ -1456,21 +1446,22 @@ async def test_rueckruf_planen_validates_then_books_only_in_background(tmp_path,
     )
     sess._gemini_ws = ws
     names = [d["name"] for t in sess._setup_payload()["tools"] for d in t["functionDeclarations"]]
-    assert names == ["hang_up", "frag_ida", "rueckruf_planen"]
+    assert names == ["hang_up", "frag_ida", "aufgabe_planen"]
 
     # a past time is rejected immediately, nothing is booked
     await sess._handle_gemini_event({"toolCall": {"functionCalls": [
-        {"id": "r0", "name": "rueckruf_planen", "args": {"uhrzeit": "00:00"}}]}})
+        {"id": "r0", "name": "aufgabe_planen", "args": {"uhrzeit": "00:00"}}]}})
     assert "error" in ws.sent[-1]["toolResponse"]["functionResponses"][0]["response"]
     assert asked == []
 
     soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
     await asyncio.wait_for(sess._handle_gemini_event({"toolCall": {"functionCalls": [
-        {"id": "r1", "name": "rueckruf_planen", "args": {"uhrzeit": soon, "grund": "Test"}}]}}), 1)
+        {"id": "r1", "name": "aufgabe_planen", "args": {"uhrzeit": soon, "aufgabe": "Ruf mich an und erinner mich an den Zahnarzt."}}]}}), 1)
     assert ws.sent[-1]["toolResponse"]["functionResponses"][0]["response"] == {"result": "ok"}
     await sess.close()  # the call ends, the booking keeps running in the background
     await asyncio.sleep(0.05)
     assert len(asked) == 1 and "erinnerung_erstellen" in asked[0] and OWNER in asked[0]
+    assert "Zahnarzt" in asked[0] and "nachricht_senden" in asked[0]
     assert len(callback_bg._tasks) == 1
     release.set()
     results = await asyncio.gather(*list(callback_bg._tasks))
@@ -1493,7 +1484,7 @@ async def test_background_callback_retries_once_then_gives_up_without_internal_b
 
     monkeypatch.setattr(callback_bg.ask_ida_mod, "ask_ida", failing)
     soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
-    plan = svc.plan_callback(job, {"uhrzeit": soon})
+    plan = svc.plan_task(job, {"uhrzeit": soon, "aufgabe": "Ruf mich an."})
     assert await callback_bg.run(settings, plan) is False
     assert len(calls) == 2
     assert not hasattr(store, "list_scheduled")  # no internal scheduler anymore

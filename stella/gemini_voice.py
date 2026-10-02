@@ -194,11 +194,13 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
 
 def callback_tool_gemini() -> dict[str, Any]:
     return {
-        "name": "rueckruf_planen",
+        "name": "aufgabe_planen",
         "description": (
-            "Plant einen Rückruf an Simon zu einer bestimmten Uhrzeit oder in X Minuten "
-            "('ruf mich um 17:25 nochmal an', 'ruf mich in zehn Minuten an'). Nutze genau eine "
-            "Zeitangabe. Bestätige danach die genaue Uhrzeit mit Worten."
+            "Plant etwas für später, das im Hintergrund über Ida Reminder erledigt wird: "
+            "Rückruf ('ruf mich um 17:25 nochmal an'), Anruf mit Erinnerung ('ruf mich an und "
+            "erinner mich an ...'), Nachricht ('schreib mir in 10 Minuten per Telegram ...') "
+            "oder jede andere Aufgabe zu einer bestimmten Zeit. Nutze genau eine Zeitangabe. "
+            "Bestätige danach sofort die genaue Uhrzeit mit Worten."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -209,17 +211,22 @@ def callback_tool_gemini() -> dict[str, Any]:
                 },
                 "in_minuten": {
                     "type": "INTEGER",
-                    "description": "Alternativ: in so vielen Minuten ab jetzt zurückrufen.",
+                    "description": "Alternativ: in so vielen Minuten ab jetzt.",
                 },
                 "datum": {
                     "type": "STRING",
                     "description": "Nur wenn nicht heute: Datum JJJJ-MM-TT.",
                 },
-                "grund": {
+                "aufgabe": {
                     "type": "STRING",
-                    "description": "Optional: Worum es beim Rückruf gehen soll.",
+                    "description": (
+                        "Was dann passieren soll, in Simons Worten, z. B. 'Ruf mich an.', "
+                        "'Ruf mich an und erinner mich an den Zahnarzttermin.', 'Schreib mir "
+                        "per Telegram: Müll rausbringen.'"
+                    ),
                 },
             },
+            "required": ["aufgabe"],
         },
     }
 
@@ -482,7 +489,7 @@ class GeminiVoiceSession:
             if name == "frag_ida" and self._ask_ida:
                 self._start_ask_ida(fc)
                 continue
-            if name == "rueckruf_planen" and self._ask_ida and self._schedule_cb:
+            if name == "aufgabe_planen" and self._ask_ida and self._schedule_cb:
                 await self._handle_callback_call(fc)
                 continue
             if name != "hang_up":
@@ -500,9 +507,9 @@ class GeminiVoiceSession:
         except StellaError as exc:
             response = {"error": exc.message}
         except Exception:
-            logger.exception("rueckruf_planen failed")
-            response = {"error": "Rückruf konnte nicht geplant werden."}
-        await self._send_function_response(fc.get("id"), "rueckruf_planen", response)
+            logger.exception("aufgabe_planen failed")
+            response = {"error": "Das konnte nicht eingeplant werden."}
+        await self._send_function_response(fc.get("id"), "aufgabe_planen", response)
 
     async def _send_function_response(self, call_id, name: str, response: dict[str, Any]) -> None:
         if self._closed or self._gemini_ws is None:

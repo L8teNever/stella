@@ -127,23 +127,19 @@ class JobService:
         )
         return self.store.get(job.id)  # type: ignore[return-value]
 
-    def plan_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
-        """Validate a spoken callback request (raises StellaError) without storing anything."""
+    def plan_task(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
+        """Validate a spoken 'do X later' request (raises StellaError); stores nothing."""
         run_at = parse_run_at(
             uhrzeit=str(args.get("uhrzeit") or ""),
             in_minuten=args.get("in_minuten"),
             datum=str(args.get("datum") or ""),
         )
-        grund = str(args.get("grund") or "").strip()[:500]
-        brief = (
-            "Rückruf, den Simon vorhin selbst am Telefon bestellt hat. "
-            f"Anlass: {grund or 'kein besonderer Grund genannt'}. "
-            "Begrüße ihn kurz, sag dass du wie gewünscht zurückrufst und frag, was du für ihn "
-            "tun kannst, bzw. erledige den genannten Anlass."
-        )
+        aufgabe = str(args.get("aufgabe") or args.get("grund") or "").strip()[:600]
+        if not aufgabe:
+            aufgabe = "Ruf mich an."
         return {
-            "run_at": run_at, "grund": grund, "brief": brief, "to": job.to_number,
-            "speak_to": job.speak_to or "Simon", "allow_ida": job.allow_ida,
+            "run_at": run_at, "aufgabe": aufgabe, "to": job.to_number,
+            "speak_to": job.speak_to or "Simon",
         }
 
     def status(self, call_id: str) -> CallJob:

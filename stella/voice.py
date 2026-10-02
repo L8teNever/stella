@@ -237,7 +237,8 @@ CALLBACK_INSTRUCTIONS = """
 Callbacks: it is now {now} (Europe/Berlin). If Simon says "ruf mich um 17:25 nochmal an",
 "ruf mich in zehn Minuten zurück" or similar, call rueckruf_planen right away (uhrzeit as
 HH:MM 24h, or in_minuten) with the reason in `grund` if he named one, then confirm the exact
-time in words. If the tool reports an error (e.g. time in the past), tell him and ask for a
+time in words right away (the booking runs in the background, so confirm instantly and
+move on, never wait or say it will take a moment). If the tool reports an error (e.g. time in the past), tell him and ask for a
 better time. You CAN call him back; never say you can't. Then continue normally or say goodbye
 and call hang_up.
 """

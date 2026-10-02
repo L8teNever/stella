@@ -151,8 +151,8 @@ class JobService:
         row["run_at_local"] = run_at.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M")
         return row
 
-    def schedule_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
-        """Gemini tool `rueckruf_planen`: call the same (owner) number back later."""
+    def plan_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
+        """Validate a spoken callback request (raises StellaError) without storing anything."""
         run_at = parse_run_at(
             uhrzeit=str(args.get("uhrzeit") or ""),
             in_minuten=args.get("in_minuten"),
@@ -165,12 +165,21 @@ class JobService:
             "Begrüße ihn kurz, sag dass du wie gewünscht zurückrufst und frag, was du für ihn "
             "tun kannst, bzw. erledige den genannten Anlass."
         )
+        return {
+            "run_at": run_at, "grund": grund, "brief": brief, "to": job.to_number,
+            "speak_to": job.speak_to or "Simon", "allow_ida": job.allow_ida,
+        }
+
+    def schedule_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
+        """Internal scheduler path: store the callback in Stella's own DB."""
+        plan = self.plan_callback(job, args)
         row = self.schedule_call(
-            to=job.to_number, brief=brief, run_at=run_at, speak_to=job.speak_to or "Simon",
-            allow_ida=job.allow_ida,
+            to=plan["to"], brief=plan["brief"], run_at=plan["run_at"],
+            speak_to=plan["speak_to"], allow_ida=plan["allow_ida"],
         )
-        return {"result": f"Rückruf geplant für {run_at.astimezone(BERLIN):%H:%M} Uhr "
-                f"am {run_at.astimezone(BERLIN):%d.%m.%Y}", "id": row["id"]}
+        run_at = plan["run_at"].astimezone(BERLIN)
+        return {"result": f"Rückruf geplant für {run_at:%H:%M} Uhr am {run_at:%d.%m.%Y}",
+                "id": row["id"]}
 
     def run_due(self, now: datetime | None = None) -> int:
         """Place calls whose time has come. Called every few seconds by the scheduler."""

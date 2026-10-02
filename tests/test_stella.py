@@ -1478,3 +1478,83 @@ async def test_master_prompt_refresh_keeps_last_good_on_error(tmp_path, monkeypa
         assert await master_prompt.refresh(make_settings(tmp_path, master_prompt_enabled=False)) is False
     finally:
         master_prompt.set_text(None)
+
+
+# --- background callback booking (Claude + Ida Reminder, detached) ----------------
+
+from stella import callback_bg  # noqa: E402
+
+
+def _plan(svc, job, hhmm):
+    return svc.plan_callback(job, {"uhrzeit": hhmm, "grund": "Test"})
+
+
+@pytest.mark.asyncio
+async def test_background_callback_success_does_not_double_book(tmp_path, monkeypatch):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+    asked: list[str] = []
+
+    async def fake_ask(_s, q, **kw):
+        asked.append(q)
+        assert kw["timeout_s"] == callback_bg.BACKGROUND_TIMEOUT_S
+        return "ERLEDIGT"
+
+    monkeypatch.setattr(callback_bg.ask_ida_mod, "ask_ida", fake_ask)
+    soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
+    plan = _plan(svc, job, soon)
+    assert await callback_bg.run(settings, svc, plan) is True
+    assert "erinnerung_erstellen" in asked[0] and OWNER in asked[0] and "Test" in asked[0]
+    assert store.list_scheduled() == []  # Ida Reminder booked it, no second booking
+
+
+@pytest.mark.asyncio
+async def test_background_callback_falls_back_to_stella_scheduler(tmp_path, monkeypatch):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+
+    async def failing(_s, q, **kw):
+        return "FEHLER: alle Plätze belegt"
+
+    monkeypatch.setattr(callback_bg.ask_ida_mod, "ask_ida", failing)
+    soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
+    assert await callback_bg.run(settings, svc, _plan(svc, job, soon)) is True
+    pending = store.list_scheduled()
+    assert len(pending) == 1 and pending[0]["to_number"] == OWNER
+
+
+@pytest.mark.asyncio
+async def test_background_callback_outlives_the_call(tmp_path, monkeypatch):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+    release = asyncio.Event()
+    done: list[str] = []
+
+    async def slow(_s, q, **kw):
+        await release.wait()
+        done.append("ok")
+        return "ERLEDIGT"
+
+    monkeypatch.setattr(callback_bg.ask_ida_mod, "ask_ida", slow)
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None, hangup_cb=lambda: None,
+        transcript_cb=lambda c: None, outcome_cb=lambda t: None,
+        schedule_cb=lambda args: (callback_bg.start(settings, svc, svc.plan_callback(job, args)),
+                                  {"result": "ok"})[1],
+    )
+    sess._gemini_ws = FakeProviderWS()
+    soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
+    await sess._handle_gemini_event({"toolCall": {"functionCalls": [
+        {"id": "r1", "name": "rueckruf_planen", "args": {"uhrzeit": soon}}]}})
+    assert sess._gemini_ws.sent[-1]["toolResponse"]["functionResponses"][0]["response"] == {"result": "ok"}
+    await sess.close()  # the call ends...
+    assert done == [] and len(callback_bg._tasks) == 1
+    release.set()  # ...but the background booking still finishes
+    await asyncio.gather(*list(callback_bg._tasks))
+    assert done == ["ok"]

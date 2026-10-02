@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 
 from stella.config import Settings, get_settings
 from stella.errors import StellaError
-from stella import master_prompt
-from stella.jobs import JobService
+from stella import callback_bg, master_prompt
+from stella.jobs import BERLIN, JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
@@ -157,7 +157,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return await websockets.connect(url, additional_headers=headers or None)
 
         def schedule_cb(args: dict) -> dict:
-            return jobs.schedule_callback(job, args)
+            # Validate now (so a past time is corrected in the call), book in the background.
+            plan = jobs.plan_callback(job, args)
+            callback_bg.start(settings, jobs, plan)
+            run_at = plan["run_at"].astimezone(BERLIN)
+            return {"result": f"Okay, der Rückruf für {run_at:%H:%M} Uhr wird im Hintergrund "
+                    "eingerichtet. Bestätige Simon die Uhrzeit sofort."}
 
         try:
             await start_voice_bridge(

@@ -186,6 +186,7 @@ async def ask_ida(
     confirmed: bool = False,
     cancel_event: asyncio.Event | None = None,
     spawn: Spawn | None = None,
+    timeout_s: float | None = None,
 ) -> str:
     """Ask Claude Code (with Ida MCP) and return a short, speakable German answer."""
     question = (question or "").strip()[:MAX_QUESTION_CHARS]
@@ -213,9 +214,8 @@ async def ask_ida(
         if cancel_event is not None:
             cancel_task = asyncio.ensure_future(cancel_event.wait())
             waiters.add(cancel_task)
-        done, _ = await asyncio.wait(
-            waiters, timeout=settings.ask_ida_timeout_s, return_when=asyncio.FIRST_COMPLETED
-        )
+        limit = timeout_s if timeout_s is not None else settings.ask_ida_timeout_s
+        done, _ = await asyncio.wait(waiters, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
         if cancel_task is not None:
             cancel_task.cancel()
         if comm not in done:
@@ -223,7 +223,7 @@ async def ask_ida(
             await _kill(proc)
             if cancel_event is not None and cancel_event.is_set():
                 return MSG_FAILED
-            logger.warning("ask_ida timed out after %.0fs", settings.ask_ida_timeout_s)
+            logger.warning("ask_ida timed out after %.0fs", limit)
             return MSG_TIMEOUT
         stdout, stderr = comm.result()
         if proc.returncode != 0:

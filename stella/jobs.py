@@ -140,6 +140,7 @@ class JobService:
         return {
             "run_at": run_at, "aufgabe": aufgabe, "to": job.to_number,
             "speak_to": job.speak_to or "Simon",
+            "kontext": str(args.get("_kontext") or "").strip()[-1500:],
         }
 
     def status(self, call_id: str) -> CallJob:

@@ -220,9 +220,10 @@ def callback_tool_gemini() -> dict[str, Any]:
                 "aufgabe": {
                     "type": "STRING",
                     "description": (
-                        "Was dann passieren soll, in Simons Worten, z. B. 'Ruf mich an.', "
+                        "Was dann passieren soll, vollständig und mit Anlass in Simons Worten, "
+                        "z. B. 'Ruf mich nochmal an wegen der Mathe-Hausaufgabe bis Montag.', "
                         "'Ruf mich an und erinner mich an den Zahnarzttermin.', 'Schreib mir "
-                        "per Telegram: Müll rausbringen.'"
+                        "per Telegram: Müll rausbringen.' Nie einen halben Satz."
                     ),
                 },
             },
@@ -267,6 +268,8 @@ class GeminiVoiceSession:
         self._gemini_aiter = None
         self._closed = False
         self._assistant_bits: list[str] = []
+        # Running dialog (both sides) so later tasks can carry the conversation context.
+        self._dialog: list[list[str]] = []
         self._up = Pcmu8kToPcm16k()
         self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
         self.provider = "gemini"
@@ -477,10 +480,14 @@ class GeminiVoiceSession:
                         self._note_first_outbound()
             # part.text is often model scratch / thinking, not spoken audio.
             # Spoken text is outputTranscription only.
+        in_piece = (server.get("inputTranscription") or {}).get("text") or ""
+        if in_piece:
+            self._note_dialog(self.job.speak_to or "Anrufer", in_piece)
         out_tx = server.get("outputTranscription") or {}
         piece = out_tx.get("text") or ""
         if piece:
             self._assistant_bits.append(piece)
+            self._note_dialog("Stella", piece)
             self._transcript(piece)
             self._farewell.note_assistant_text(piece)
 
@@ -501,6 +508,19 @@ class GeminiVoiceSession:
             self.guard.arm_hangup(self._deferred_hangup)
             return
 
+    def _note_dialog(self, speaker: str, text: str) -> None:
+        if self._dialog and self._dialog[-1][0] == speaker:
+            self._dialog[-1][1] += text
+        else:
+            self._dialog.append([speaker, text])
+        del self._dialog[:-40]
+
+    def dialog_context(self, limit: int = 1500) -> str:
+        """Last part of the conversation as 'Speaker: text' lines (newest kept)."""
+        lines = [f"{who}: {' '.join(text.split())}" for who, text in self._dialog if text.strip()]
+        out = "\n".join(lines)
+        return out[-limit:]
+
     async def _handle_callback_call(self, fc: dict[str, Any]) -> None:
         args = fc.get("args") or fc.get("arguments") or {}
         key = (
@@ -515,7 +535,7 @@ class GeminiVoiceSession:
             )
             return
         try:
-            response = self._schedule_cb(args)
+            response = self._schedule_cb(dict(args, _kontext=self.dialog_context()))
             if "error" not in response:
                 self._planned.add(key)
         except StellaError as exc:

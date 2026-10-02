@@ -32,8 +32,15 @@ def build_request(plan: dict[str, Any]) -> str:
         f"{run_at:%Y-%m-%d %H:%M} (Europe/Berlin) Ida auslöst. Aufgabe der Erinnerung, wörtlich: "
         f"'Auftrag von Simon, am Telefon gegeben, auszuführen um {run_at:%H:%M} Uhr: "
         f"{plan['aufgabe']} "
-        f"Hinweise: Anrufe an Simon über stella_call (to={plan['to']}, speak_to={plan['speak_to']}, "
-        "allow_ida=true, brief = was Stella ihm sagen soll plus der Satz: 'Danach frag, ob Simon noch "
+        + (
+            f"Gesprächskontext (Ausschnitt aus dem Telefonat, in dem Simon das aufgetragen hat): "
+            f"<<<{plan['kontext']}>>> "
+            if plan.get("kontext")
+            else ""
+        )
+        + f"Hinweise: Anrufe an Simon über stella_call (to={plan['to']}, speak_to={plan['speak_to']}, "
+        "allow_ida=true, context = der Gesprächskontext oben vollständig, brief = was Stella ihm "
+        "sagen soll, mit dem konkreten Anlass, plus der Satz: 'Danach frag, ob Simon noch "
         "etwas braucht; weitere Wünsche von ihm führst du mit frag_ida aus, bevor du auflegst.'); "
         "Nachrichten an Simon über Telegram (nachricht_senden); "
         "alles andere mit den passenden Tools. Danach diese Erinnerung leeren.' "

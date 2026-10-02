@@ -1516,3 +1516,41 @@ async def test_aufgabe_planen_dedupes_repeated_calls(tmp_path):
     await sess._handle_gemini_event({"toolCall": {"functionCalls": [other]}})
     assert len(booked) == 2
     assert "Per\nAnruf, per Telegram oder beides" in sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_aufgabe_planen_carries_conversation_context(tmp_path):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    job = store.create(kind="call", to_number=OWNER, brief="b", speak_to="Simon", allow_ida=True)
+    plans: list[dict] = []
+
+    def schedule_cb(args):
+        plans.append(svc.plan_task(job, args))
+        return {"result": "Eingeplant."}
+
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None, hangup_cb=lambda: None,
+        transcript_cb=lambda c: None, outcome_cb=lambda t: None, schedule_cb=schedule_cb,
+    )
+    sess._gemini_ws = FakeProviderWS()
+    for ev in (
+        {"serverContent": {"inputTranscription": {"text": "Ich muss noch die Mathe-"}}},
+        {"serverContent": {"inputTranscription": {"text": "Hausaufgabe bis Montag machen."}}},
+        {"serverContent": {"outputTranscription": {"text": "Soll ich dich daran erinnern?"}}},
+        {"serverContent": {"inputTranscription": {"text": "Ja, ruf mich um 18 Uhr nochmal an deswegen."}}},
+    ):
+        await sess._handle_gemini_event(ev)
+    ctx = sess.dialog_context()
+    assert ctx.splitlines()[0] == "Simon: Ich muss noch die Mathe-Hausaufgabe bis Montag machen."
+    assert ctx.splitlines()[1].startswith("Stella: Soll ich")
+
+    soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
+    await sess._handle_gemini_event({"toolCall": {"functionCalls": [{
+        "id": "a", "name": "aufgabe_planen",
+        "args": {"uhrzeit": soon, "aufgabe": "Ruf mich nochmal an wegen der Mathe-Hausaufgabe."}}]}})
+    assert "Mathe-Hausaufgabe bis Montag" in plans[0]["kontext"]
+    request = callback_bg.build_request(plans[0])
+    assert "Gesprächskontext" in request and "Mathe-Hausaufgabe bis Montag" in request
+    assert "context = der Gesprächskontext" in request

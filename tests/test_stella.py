@@ -692,7 +692,7 @@ def test_gemini_setup_includes_phone_vad(tmp_path):
     assert cfg == vad
     assert payload["generationConfig"]["responseModalities"] == ["AUDIO"]
     assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
-    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+    assert "thinkingBudget" not in payload["generationConfig"]["thinkingConfig"]
     assert "call hang_up" in payload["systemInstruction"]["parts"][0]["text"]
     assert "ich verstehe nicht" in payload["systemInstruction"]["parts"][0]["text"]
 
@@ -796,7 +796,7 @@ def test_gemini_setup_client_vad_disables_automatic(tmp_path):
     aad = payload["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad == {"disabled": True}
     assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
-    assert payload["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+    assert "thinkingBudget" not in payload["generationConfig"]["thinkingConfig"]
 
 
 @pytest.mark.asyncio
@@ -912,7 +912,6 @@ def test_gemini_model_override_and_thinking_config(tmp_path):
     assert gemini_uses_thinking_level("gemini-3.8-live")
     assert gemini_generation_config(live)["thinkingConfig"] == {
         "thinkingLevel": "minimal",
-        "thinkingBudget": 0,
     }
 
     pinned = make_settings(

@@ -122,12 +122,9 @@ def gemini_generation_config(
     if budget >= 0:
         mid = model if model is not None else gemini_model_id(settings)
         if gemini_uses_thinking_level(mid):
-            # 3.x Live: thinkingLevel. Keep thinkingBudget=0 as well (lowest TTFT).
-            thinking: dict[str, Any] = {
-                "thinkingLevel": "minimal" if budget == 0 else "low",
-                "thinkingBudget": budget,
-            }
-            cfg["thinkingConfig"] = thinking
+            # 3.x Live: thinkingLevel only. The API rejects setup (close 1007) when
+            # thinkingLevel and thinkingBudget are both set.
+            cfg["thinkingConfig"] = {"thinkingLevel": "minimal" if budget == 0 else "low"}
         else:
             cfg["thinkingConfig"] = {"thinkingBudget": budget}
     return cfg

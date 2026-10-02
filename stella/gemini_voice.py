@@ -169,7 +169,10 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
             "properties": {
                 "frage": {
                     "type": "STRING",
-                    "description": "Die Frage von Simon, vollständig und eigenständig formuliert.",
+                    "description": (
+                        "Simons Frage möglichst wörtlich, inklusive des genannten Zeitraums "
+                        "(z. B. 'morgen'). Nichts hinzufügen oder erweitern."
+                    ),
                 },
                 "bestaetigt": {
                     "type": "BOOLEAN",

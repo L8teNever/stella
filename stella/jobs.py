@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -13,6 +16,55 @@ from stella.store import CallJob, JobStore
 from stella.telnyx_client import TelnyxClient
 
 logger = logging.getLogger(__name__)
+
+BERLIN = ZoneInfo("Europe/Berlin")
+MAX_SCHEDULE_AHEAD = timedelta(days=14)
+SCHEDULE_GRACE = timedelta(minutes=10)  # still run if the process was down at the due time
+_HHMM = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:uhr)?\s*$", re.IGNORECASE)
+
+
+def parse_run_at(
+    *, uhrzeit: str = "", in_minuten: Any = None, datum: str = "", now: datetime | None = None
+) -> datetime:
+    """Resolve a spoken callback time (Europe/Berlin) to an aware datetime. Raises StellaError."""
+    now = (now or datetime.now(timezone.utc)).astimezone(BERLIN)
+    uhrzeit = (uhrzeit or "").strip()
+    if in_minuten not in (None, ""):
+        try:
+            minutes = int(in_minuten)
+        except (TypeError, ValueError):
+            raise StellaError("`in_minuten` muss eine ganze Zahl sein.", "invalid_time") from None
+        if minutes < 1:
+            raise StellaError("`in_minuten` muss mindestens 1 sein.", "invalid_time")
+        run_at = now + timedelta(minutes=minutes)
+    elif uhrzeit:
+        try:
+            run_at = datetime.fromisoformat(uhrzeit)
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=BERLIN)
+        except ValueError:
+            m = _HHMM.match(uhrzeit)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                raise StellaError(
+                    f"Uhrzeit '{uhrzeit}' nicht verständlich, erwarte HH:MM (24h).", "invalid_time"
+                ) from None
+            day = now.date()
+            if datum:
+                try:
+                    day = datetime.fromisoformat(datum.strip()).date()
+                except ValueError:
+                    raise StellaError(f"Datum '{datum}' ungültig (JJJJ-MM-TT).", "invalid_time") from None
+            run_at = datetime(day.year, day.month, day.day, int(m.group(1)), int(m.group(2)), tzinfo=BERLIN)
+    else:
+        raise StellaError("Gib `uhrzeit` (HH:MM) oder `in_minuten` an.", "invalid_time")
+    if run_at <= now:
+        raise StellaError(
+            f"Die Zeit {run_at:%H:%M} liegt in der Vergangenheit (jetzt {now:%H:%M} Uhr).",
+            "time_in_past",
+        )
+    if run_at - now > MAX_SCHEDULE_AHEAD:
+        raise StellaError("Rückrufe sind nur bis 14 Tage im Voraus möglich.", "time_too_far")
+    return run_at
 
 
 class JobService:
@@ -75,6 +127,76 @@ class JobService:
             telnyx_call_leg_id=dialed.get("call_leg_id") or "",
         )
         return self.store.get(job.id)  # type: ignore[return-value]
+
+    def schedule_call(
+        self,
+        *,
+        to: str,
+        brief: str,
+        run_at: datetime,
+        context: str = "",
+        speak_to: str = "",
+        kind: str = "call",
+        allow_ida: bool | None = None,
+    ) -> dict[str, Any]:
+        to_e164 = normalize_e164(to)
+        if not (brief or "").strip():
+            raise StellaError("Missing `brief` (task / script context).", "invalid_brief")
+        if not (self.settings.gemini_api_key or "").strip():
+            raise StellaError("GEMINI_API_KEY is not set; cannot schedule calls.", "gemini_key_missing")
+        row = self.store.schedule_call(
+            run_at=run_at, to_number=to_e164, brief=brief.strip(), context=(context or "").strip(),
+            speak_to=(speak_to or "").strip(), kind=kind, allow_ida=allow_ida,
+        )
+        row["run_at_local"] = run_at.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M")
+        return row
+
+    def schedule_callback(self, job: CallJob, args: dict[str, Any]) -> dict[str, Any]:
+        """Gemini tool `rueckruf_planen`: call the same (owner) number back later."""
+        run_at = parse_run_at(
+            uhrzeit=str(args.get("uhrzeit") or ""),
+            in_minuten=args.get("in_minuten"),
+            datum=str(args.get("datum") or ""),
+        )
+        grund = str(args.get("grund") or "").strip()[:500]
+        brief = (
+            "Rückruf, den Simon vorhin selbst am Telefon bestellt hat. "
+            f"Anlass: {grund or 'kein besonderer Grund genannt'}. "
+            "Begrüße ihn kurz, sag dass du wie gewünscht zurückrufst und frag, was du für ihn "
+            "tun kannst, bzw. erledige den genannten Anlass."
+        )
+        row = self.schedule_call(
+            to=job.to_number, brief=brief, run_at=run_at, speak_to=job.speak_to or "Simon",
+            allow_ida=job.allow_ida,
+        )
+        return {"result": f"Rückruf geplant für {run_at.astimezone(BERLIN):%H:%M} Uhr "
+                f"am {run_at.astimezone(BERLIN):%d.%m.%Y}", "id": row["id"]}
+
+    def run_due(self, now: datetime | None = None) -> int:
+        """Place calls whose time has come. Called every few seconds by the scheduler."""
+        now = now or datetime.now(timezone.utc)
+        ran = 0
+        for row in self.store.claim_due(now):
+            due = datetime.fromisoformat(row["run_at"])
+            if now - due > SCHEDULE_GRACE:
+                self.store.finish_scheduled(row["id"], status="missed", error="process was down")
+                logger.warning("scheduled call %s missed (due %s)", row["id"], row["run_at"])
+                continue
+            try:
+                job = self.place_call(
+                    to=row["to_number"], brief=row["brief"], context=row["context"],
+                    speak_to=row["speak_to"], kind=row["kind"],
+                    allow_ida=None if row["allow_ida"] is None else bool(row["allow_ida"]),
+                )
+                self.store.finish_scheduled(row["id"], status="done", job_id=job.id)
+                ran += 1
+            except StellaError as exc:
+                self.store.finish_scheduled(row["id"], status="failed", error=exc.message)
+                logger.warning("scheduled call %s failed: %s", row["id"], exc.message)
+            except Exception as exc:  # noqa: BLE001
+                self.store.finish_scheduled(row["id"], status="failed", error=str(exc))
+                logger.exception("scheduled call %s crashed", row["id"])
+        return ran
 
     def status(self, call_id: str) -> CallJob:
         job = self.store.get(call_id)

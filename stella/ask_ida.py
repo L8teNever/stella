@@ -24,7 +24,7 @@ from stella.errors import StellaError, normalize_e164
 logger = logging.getLogger(__name__)
 
 MAX_ANSWER_CHARS = 600
-MAX_QUESTION_CHARS = 500
+MAX_QUESTION_CHARS = 1200
 NEEDS_CONFIRMATION = "AKTION_BRAUCHT_BESTAETIGUNG"
 BUILTIN_DENY = "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Read,Glob,Grep,Task,TodoWrite"
 

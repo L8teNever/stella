@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 from stella.config import Settings
@@ -226,7 +228,17 @@ Not for general knowledge: answer those yourself or say you don't know.
 """
 
 
-def build_instructions(job: CallJob, *, ask_ida: bool = False) -> str:
+CALLBACK_INSTRUCTIONS = """
+Callbacks: it is now {now} (Europe/Berlin). If Simon says "ruf mich um 17:25 nochmal an",
+"ruf mich in zehn Minuten zurück" or similar, call rueckruf_planen right away (uhrzeit as
+HH:MM 24h, or in_minuten) with the reason in `grund` if he named one, then confirm the exact
+time in words. If the tool reports an error (e.g. time in the past), tell him and ask for a
+better time. You CAN call him back; never say you can't. Then continue normally or say goodbye
+and call hang_up.
+"""
+
+
+def build_instructions(job: CallJob, *, ask_ida: bool = False, callback: bool = False) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
     lang = ""
     if job_wants_german(job):
@@ -238,6 +250,9 @@ def build_instructions(job: CallJob, *, ask_ida: bool = False) -> str:
         )
     ctx = job.context.strip() or "(none provided)"
     ida = ASK_IDA_INSTRUCTIONS if ask_ida else ""
+    if ask_ida and callback:
+        now = datetime.now(ZoneInfo("Europe/Berlin"))
+        ida += CALLBACK_INSTRUCTIONS.format(now=f"{now:%A, %d.%m.%Y, %H:%M}")
     return (
         f"{STELLA_SYSTEM}\n\n"
         f"{speak}"
@@ -344,6 +359,7 @@ async def start_voice_bridge(
     hangup_cb,
     transcript_cb,
     outcome_cb,
+    schedule_cb=None,
 ) -> str:
     """Run the Gemini Live bridge for this job."""
     from stella.gemini_voice import GeminiVoiceSession
@@ -358,6 +374,7 @@ async def start_voice_bridge(
         hangup_cb=hangup_cb,
         transcript_cb=transcript_cb,
         outcome_cb=outcome_cb,
+        schedule_cb=schedule_cb,
     )
     gem._telnyx_ws = telnyx_ws
     await gem.connect()

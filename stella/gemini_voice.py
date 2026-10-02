@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from stella.ask_ida import MSG_BUSY, ask_ida, ida_allowed_for
 from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
 from stella.config import Settings
+from stella.errors import StellaError
 from stella.energy_vad import EnergyVad, EnergyVadConfig, pcm_rms
 from stella.store import CallJob
 from stella.voice import (
@@ -191,10 +192,44 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
     }
 
 
-def gemini_tools(*, ask_ida: bool) -> list[dict[str, Any]]:
+def callback_tool_gemini() -> dict[str, Any]:
+    return {
+        "name": "rueckruf_planen",
+        "description": (
+            "Plant einen Rückruf an Simon zu einer bestimmten Uhrzeit oder in X Minuten "
+            "('ruf mich um 17:25 nochmal an', 'ruf mich in zehn Minuten an'). Nutze genau eine "
+            "Zeitangabe. Bestätige danach die genaue Uhrzeit mit Worten."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "uhrzeit": {
+                    "type": "STRING",
+                    "description": "Uhrzeit im 24-Stunden-Format HH:MM, z. B. 17:25.",
+                },
+                "in_minuten": {
+                    "type": "INTEGER",
+                    "description": "Alternativ: in so vielen Minuten ab jetzt zurückrufen.",
+                },
+                "datum": {
+                    "type": "STRING",
+                    "description": "Nur wenn nicht heute: Datum JJJJ-MM-TT.",
+                },
+                "grund": {
+                    "type": "STRING",
+                    "description": "Optional: Worum es beim Rückruf gehen soll.",
+                },
+            },
+        },
+    }
+
+
+def gemini_tools(*, ask_ida: bool, callback: bool = False) -> list[dict[str, Any]]:
     tools = hang_up_tool_gemini()
     if ask_ida:
         tools["functionDeclarations"].append(ask_ida_tool_gemini())
+        if callback:
+            tools["functionDeclarations"].append(callback_tool_gemini())
     return [tools]
 
 
@@ -210,8 +245,10 @@ class GeminiVoiceSession:
         hangup_cb,
         transcript_cb,
         outcome_cb,
+        schedule_cb=None,
     ) -> None:
         self.settings = settings
+        self._schedule_cb = schedule_cb
         self.job = job
         self._gemini_connect = gemini_connect
         self._hangup = hangup_cb
@@ -343,9 +380,9 @@ class GeminiVoiceSession:
             "model": gemini_model_name(self.settings, model),
             "generationConfig": gemini_generation_config(self.settings, model),
             "systemInstruction": {
-                "parts": [{"text": build_instructions(self.job, ask_ida=self._ask_ida)}]
+                "parts": [{"text": build_instructions(self.job, ask_ida=self._ask_ida, callback=bool(self._schedule_cb))}]
             },
-            "tools": gemini_tools(ask_ida=self._ask_ida),
+            "tools": gemini_tools(ask_ida=self._ask_ida, callback=bool(self._schedule_cb)),
             "outputAudioTranscription": {},
             "inputAudioTranscription": {},
             "realtimeInputConfig": gemini_realtime_input_config(self.settings),
@@ -445,6 +482,9 @@ class GeminiVoiceSession:
             if name == "frag_ida" and self._ask_ida:
                 self._start_ask_ida(fc)
                 continue
+            if name == "rueckruf_planen" and self._ask_ida and self._schedule_cb:
+                await self._handle_callback_call(fc)
+                continue
             if name != "hang_up":
                 continue
             outcome = parse_hang_up_args(fc.get("args") or fc.get("arguments") or {})
@@ -452,6 +492,17 @@ class GeminiVoiceSession:
             await self._send_function_response(fc.get("id"), "hang_up", {"result": "hanging up"})
             self.guard.arm_hangup(self._deferred_hangup)
             return
+
+    async def _handle_callback_call(self, fc: dict[str, Any]) -> None:
+        args = fc.get("args") or fc.get("arguments") or {}
+        try:
+            response = self._schedule_cb(args)
+        except StellaError as exc:
+            response = {"error": exc.message}
+        except Exception:
+            logger.exception("rueckruf_planen failed")
+            response = {"error": "Rückruf konnte nicht geplant werden."}
+        await self._send_function_response(fc.get("id"), "rueckruf_planen", response)
 
     async def _send_function_response(self, call_id, name: str, response: dict[str, Any]) -> None:
         if self._closed or self._gemini_ws is None:

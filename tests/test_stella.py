@@ -198,7 +198,14 @@ def test_mcp_tools_registered(tmp_path):
     svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
     mcp = build_mcp(svc)
     names = {t.name for t in mcp._tool_manager.list_tools()}
-    assert names == {"stella_call", "stella_call_status", "stella_briefing_call"}
+    assert names == {
+        "stella_call",
+        "stella_call_status",
+        "stella_briefing_call",
+        "stella_schedule_call",
+        "stella_scheduled_calls",
+        "stella_cancel_scheduled_call",
+    }
 
 
 def test_health_and_call_http(tmp_path):
@@ -1324,3 +1331,98 @@ def test_fir_decimator_flat_in_band_and_rejects_aliases():
 
     up = FirUpsampler2().process(tone(1000, 8000))
     assert len(up) == 16000 and abs(rms(up) - rms(tone(1000, 8000))) < 0.03 * ref
+
+
+# --- scheduled callbacks ------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+
+from stella.jobs import BERLIN, parse_run_at  # noqa: E402
+
+NOW = datetime(2026, 10, 2, 15, 0, tzinfo=BERLIN)
+
+
+def test_parse_run_at_variants_and_errors():
+    assert parse_run_at(uhrzeit="17:25", now=NOW) == datetime(2026, 10, 2, 17, 25, tzinfo=BERLIN)
+    assert parse_run_at(uhrzeit="17.25 Uhr", now=NOW).hour == 17
+    assert parse_run_at(in_minuten=10, now=NOW) == NOW + timedelta(minutes=10)
+    assert parse_run_at(uhrzeit="09:00", datum="2026-10-03", now=NOW).day == 3
+    assert parse_run_at(uhrzeit="2026-10-02T18:00:00", now=NOW).hour == 18
+    for kwargs, code in (
+        ({"uhrzeit": "14:00"}, "time_in_past"),
+        ({"uhrzeit": "25:99"}, "invalid_time"),
+        ({"uhrzeit": "bald"}, "invalid_time"),
+        ({}, "invalid_time"),
+        ({"in_minuten": 0}, "invalid_time"),
+        ({"uhrzeit": "10:00", "datum": "2027-01-01"}, "time_too_far"),
+    ):
+        with pytest.raises(StellaError) as ei:
+            parse_run_at(now=NOW, **kwargs)
+        assert ei.value.code == code, kwargs
+
+
+def test_scheduled_call_runs_when_due_once_and_cancel(tmp_path):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    now = datetime.now(timezone.utc)
+    due = svc.schedule_call(to=OWNER, brief="Rückruf", run_at=now + timedelta(minutes=5))
+    later = svc.schedule_call(to=OWNER, brief="x", run_at=now + timedelta(hours=2))
+    assert svc.run_due(now) == 0 and transport.calls == []
+    assert svc.run_due(now + timedelta(minutes=6)) == 1
+    assert len(transport.calls) == 1
+    assert svc.run_due(now + timedelta(minutes=7)) == 0  # not run twice
+    row = [r for r in store.list_scheduled("done") if r["id"] == due["id"]][0]
+    assert row["job_id"]
+    assert store.cancel_scheduled(later["id"]) is True
+    assert svc.run_due(now + timedelta(hours=3)) == 0 and len(transport.calls) == 1
+
+
+def test_scheduled_call_missed_when_process_was_down(tmp_path):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    now = datetime.now(timezone.utc)
+    sc = svc.schedule_call(to=OWNER, brief="x", run_at=now + timedelta(minutes=1))
+    assert svc.run_due(now + timedelta(minutes=30)) == 0
+    assert store.list_scheduled("missed")[0]["id"] == sc["id"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_rueckruf_planen_tool(tmp_path):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+    ws = FakeProviderWS()
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None, hangup_cb=lambda: None,
+        transcript_cb=lambda c: None, outcome_cb=lambda t: None,
+        schedule_cb=lambda args: svc.schedule_callback(job, args),
+    )
+    sess._gemini_ws = ws
+    names = [d["name"] for t in sess._setup_payload()["tools"] for d in t["functionDeclarations"]]
+    assert names == ["hang_up", "frag_ida", "rueckruf_planen"]
+    assert "rueckruf_planen" in sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
+
+    soon = (datetime.now(BERLIN) + timedelta(minutes=30)).strftime("%H:%M")
+    await sess._handle_gemini_event({"toolCall": {"functionCalls": [
+        {"id": "r1", "name": "rueckruf_planen", "args": {"uhrzeit": soon, "grund": "Test"}}]}})
+    resp = ws.sent[-1]["toolResponse"]["functionResponses"][0]
+    assert resp["id"] == "r1" and "Rückruf geplant" in resp["response"]["result"]
+    pending = store.list_scheduled()
+    assert len(pending) == 1 and pending[0]["to_number"] == OWNER and "Test" in pending[0]["brief"]
+
+    await sess._handle_gemini_event({"toolCall": {"functionCalls": [
+        {"id": "r2", "name": "rueckruf_planen", "args": {"uhrzeit": "00:00"}}]}})
+    err = ws.sent[-1]["toolResponse"]["functionResponses"][0]["response"]
+    assert "Vergangenheit" in err["error"] or "00:00" in err["error"]
+    assert len(store.list_scheduled()) == 1
+
+    # no tool without owner/callback
+    plain = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None, hangup_cb=lambda: None,
+        transcript_cb=lambda c: None, outcome_cb=lambda t: None,
+    )
+    assert "rueckruf_planen" not in str(plain._setup_payload()["tools"])

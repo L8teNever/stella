@@ -101,6 +101,24 @@ class JobStore:
                 pass
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS scheduled_calls (
+                    id TEXT PRIMARY KEY,
+                    run_at TEXT NOT NULL,
+                    to_number TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'call',
+                    brief TEXT NOT NULL,
+                    context TEXT NOT NULL DEFAULT '',
+                    speak_to TEXT NOT NULL DEFAULT '',
+                    allow_ida INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    job_id TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id TEXT NOT NULL,
@@ -183,6 +201,68 @@ class JobStore:
                 (call_control_id,),
             ).fetchone()
         return self._row_to_job(row) if row else None
+
+    # --- scheduled calls (callbacks) ---------------------------------------
+
+    def schedule_call(
+        self,
+        *,
+        run_at: datetime,
+        to_number: str,
+        brief: str,
+        context: str = "",
+        speak_to: str = "",
+        kind: str = "call",
+        allow_ida: bool | None = None,
+    ) -> dict[str, Any]:
+        sid = str(uuid.uuid4())
+        run_iso = run_at.astimezone(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduled_calls (id, run_at, to_number, kind, brief, context,"
+                " speak_to, allow_ida, status, created_at) VALUES (?,?,?,?,?,?,?,?,'pending',?)",
+                (sid, run_iso, to_number, kind, brief, context, speak_to,
+                 None if allow_ida is None else int(allow_ida), _now()),
+            )
+            conn.commit()
+        return {"id": sid, "run_at": run_iso, "to": to_number, "status": "pending"}
+
+    def list_scheduled(self, status: str = "pending") -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_calls WHERE status = ? ORDER BY run_at", (status,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cancel_scheduled(self, sid: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE scheduled_calls SET status='cancelled' WHERE id=? AND status='pending'",
+                (sid,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def claim_due(self, now: datetime) -> list[dict[str, Any]]:
+        """Atomically mark due pending rows as 'running' and return them."""
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_calls WHERE status='pending' AND run_at <= ? ORDER BY run_at",
+                (now_iso,),
+            ).fetchall()
+            for r in rows:
+                conn.execute("UPDATE scheduled_calls SET status='running' WHERE id=?", (r["id"],))
+            conn.commit()
+        return [dict(r) for r in rows]
+
+    def finish_scheduled(self, sid: str, *, status: str, job_id: str = "", error: str = "") -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_calls SET status=?, job_id=?, error=? WHERE id=?",
+                (status, job_id, error[:1000], sid),
+            )
+            conn.commit()
 
     def update(self, job_id: str, **fields: Any) -> CallJob | None:
         if not fields:

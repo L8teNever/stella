@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -44,8 +45,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logging.basicConfig(level=logging.INFO)
-        async with mcp.session_manager.run():
-            yield
+
+        async def scheduler() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(jobs.run_due)
+                except Exception:
+                    logger.exception("scheduler tick failed")
+                await asyncio.sleep(10)
+
+        task = asyncio.create_task(scheduler())
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            task.cancel()
 
     app = FastAPI(title="Stella", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -134,6 +148,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             return await websockets.connect(url, additional_headers=headers or None)
 
+        def schedule_cb(args: dict) -> dict:
+            return jobs.schedule_callback(job, args)
+
         try:
             await start_voice_bridge(
                 settings=settings,
@@ -143,6 +160,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 hangup_cb=hangup_cb,
                 transcript_cb=transcript_cb,
                 outcome_cb=outcome_cb,
+                schedule_cb=schedule_cb,
             )
         except WebSocketDisconnect:
             pass

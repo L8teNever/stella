@@ -1,27 +1,25 @@
 # Stella
 
-Independent **voice / phone** stack. Ida (or Grok Bot) dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Grok Voice** (primary). If Grok realtime fails, Stella falls back to **Gemini Live** using `GEMINI_API_KEY`. Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. There is no mid-call roundtrip to Ida.
+Independent **voice / phone** stack. Ida dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Gemini Live** (`GEMINI_API_KEY`). Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. There is no mid-call roundtrip to Ida.
 
 ```
 Ida / Cursor  --MCP-->  Stella HTTP
                             |  POST /v2/calls (Telnyx dial + stream_url)
                             |  webhooks /webhooks/telnyx  → SQLite status
-                            |  WS /media/{job_id}  <-->  Grok realtime (primary)
-                            |                       or Gemini Live (fallback)
+                            |  WS /media/{job_id}  <-->  Gemini Live
 ```
 
 ## Run (Docker)
 
 ```bash
 cp .env.example .env
-# fill Telnyx + XAI_API_KEY (or complete OAuth after the container is up)
-# optional: GEMINI_API_KEY so a Grok realtime 403 can fall back to Gemini Live
+# fill Telnyx + GEMINI_API_KEY
 docker compose up --build
 ```
 
 Health: `GET http://localhost:8080/health`
 
-Telnyx must be able to reach Stella. Locally, put a tunnel in front (ngrok / cloudflared) and set:
+Telnyx must be able to reach Stella. Locally, put a tunnel in front (e.g. cloudflared) and set:
 
 ```
 STELLA_PUBLIC_BASE_URL=https://your-tunnel.example
@@ -41,8 +39,7 @@ See `.env.example`. Required for a real outbound call:
 | `TELNYX_FROM_NUMBER` | E.164 caller ID |
 | `TELNYX_PUBLIC_KEY` | Ed25519 public key to verify webhooks |
 | `STELLA_PUBLIC_BASE_URL` | Public HTTPS origin Telnyx can hit |
-| `XAI_API_KEY` **or** SuperGrok OAuth tokens | Grok Voice (primary) |
-| `GEMINI_API_KEY` | Gemini Live fallback when Grok session connect fails |
+| `GEMINI_API_KEY` | Gemini Live (voice provider) |
 
 Optional: `STELLA_CALLBACK_URL` (POST JSON when a call hangs up), `STELLA_MCP_TOKEN` (Bearer for `/mcp`).
 
@@ -50,39 +47,13 @@ Optional: `STELLA_CALLBACK_URL` (POST JSON when a call hangs up), `STELLA_MCP_TO
 
 No secrets belong in git.
 
-## xAI / SuperGrok OAuth
+## Gemini Live
 
-Same device-code pattern as Warp / Hermes (`auth.x.ai`, public Grok CLI `client_id`). Tokens are stored in the `stella-data` volume (`XAI_OAUTH_TOKEN_PATH`).
+`GET /health` reports `voice_provider.primary` (`gemini`). If `GEMINI_API_KEY` is empty, `stella_call` fails with an explicit error before dialing.
 
-Inside the container:
+Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants **PCM 16-bit LE / 16 kHz in** and typically **24 kHz PCM out**, so Stella box-filter downsamples, μ-law-encodes, and emits aligned 20 ms frames on the bridge. After a job is created, `stella_call_status` includes `voice_provider` (always `gemini`).
 
-```bash
-docker compose exec stella stella oauth login
-# open the printed URL, approve, wait until tokens are saved
-docker compose exec stella stella oauth status
-```
-
-Or HTTP:
-
-1. `POST /oauth/xai/start`
-2. Approve in the browser
-3. `POST /oauth/xai/poll` with `{ "device_code": "..." }`
-
-If both OAuth tokens and `XAI_API_KEY` exist, **OAuth wins** (subscription quota). `XAI_API_KEY` is the documented local/dev fallback.
-
-Voice model default: `grok-voice-latest` (`XAI_VOICE_MODEL`). Voice: `XAI_VOICE=eve`.
-
-## Gemini Live fallback (sticky per call)
-
-Grok remains the primary realtime path. When MCP starts a call (`stella_call` / `stella_briefing_call`), Stella probes Grok Voice realtime **once**. Success → **Grok for the entire call**. Failure (HTTP 403, auth, quota/limit, connect) → **Gemini Live for the entire call**. That choice is stored on the job (`voice_provider`) and reused if Telnyx reconnects `/media/{job_id}`. There is no mid-call re-probe and no fallback after the session is already running.
-
-Grok-down cache (bonus, in-memory, this process only): a failed Grok probe is remembered for **`GROK_DOWN_CACHE_TTL_SECONDS` = 300 (5 minutes)** so the next MCP call does not pay the 403 handshake again. After the TTL, Stella probes Grok again. `GET /health` reports `voice_provider.sticky`, `grok_down_cache_ttl_seconds`, and `grok_down_cached`.
-
-Telnyx streams **PCMU 8 kHz** (20 ms / 160-byte RTP frames). Gemini Live wants **PCM 16-bit LE / 16 kHz in** and typically **24 kHz PCM out**, so Stella box-filter downsamples, μ-law-encodes, and emits aligned 20 ms frames on the bridge. After a job is created, `stella_call_status` includes `voice_provider` (`grok` or `gemini`).
-
-If Grok cannot be used and `GEMINI_API_KEY` is empty, the job fails with an explicit error before dial (or the media session fails if only Gemini was locked).
-
-Optional overrides: **`GEMINI_LIVE_MODEL`** (default **`gemini-3.8-live`**, confirmed Live / native-audio BidiGenerateContent id — [model card](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live)). Do **not** set `gemini-3.8-live-extended-thinking` (extra reasoning latency). The host may pin the same default with `GEMINI_LIVE_MODEL=gemini-3.8-live`. `GEMINI_VOICE` defaults to `Aoede` (female). Grok remains `XAI_VOICE=eve`. `GEMINI_THINKING_BUDGET` defaults to `0` (thinking off): 2.5 Live gets `thinkingBudget: 0`; 3.x Live also sends `thinkingLevel: minimal`. Set `-1` to omit `thinkingConfig`.
+Optional overrides: **`GEMINI_LIVE_MODEL`** (default **`gemini-3.8-live`**, confirmed Live / native-audio BidiGenerateContent id — [model card](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live)). Do **not** set `gemini-3.8-live-extended-thinking` (extra reasoning latency). The host may pin the same default with `GEMINI_LIVE_MODEL=gemini-3.8-live`. `GEMINI_VOICE` defaults to `Aoede` (female). `GEMINI_THINKING_BUDGET` defaults to `0` (thinking off): 2.5 Live gets `thinkingBudget: 0`; 3.x Live also sends `thinkingLevel: minimal`. Set `-1` to omit `thinkingConfig`.
 
 **Turn latency (Gemini):** By default Stella uses **client RMS VAD** (`STELLA_CLIENT_VAD=true`): inbound PCMU is energy-gated locally; after ~`STELLA_CLIENT_VAD_SILENCE_MS` (default 120) of quiet following speech, Stella sends `realtimeInput.activityEnd` and Gemini starts the reply without waiting for Google’s automatic end-of-speech (often ~1–2s+). Automatic VAD is disabled in that mode. Set `STELLA_CLIENT_VAD=false` to use Google’s detector (`GEMINI_VAD_SILENCE_DURATION_MS`, `GEMINI_VAD_START_SENSITIVITY` / `END_SENSITIVITY`, `GEMINI_VAD_PREFIX_PADDING_MS`). Barge-in still uses `START_OF_ACTIVITY_INTERRUPTS`; Telnyx `clear` is sent only on Gemini `interrupted`, not on every energy blip.
 
@@ -99,9 +70,9 @@ The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5
 3. Copy API key, connection id, and webhook public key.
 4. Point the connection’s webhook at `{STELLA_PUBLIC_BASE_URL}/webhooks/telnyx` (Stella also sends `webhook_url` on each dial).
 
-Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to the provider chosen at MCP call start (Grok Voice or Gemini Live). Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
+Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to Gemini Live. Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
 
-## MCP (Ida / Cursor / Grok Bot)
+## MCP (Ida / Cursor)
 
 ### HTTP (recommended for Docker)
 
@@ -168,7 +139,7 @@ Python 3.12+:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-export STELLA_DB_PATH=./data/stella.db XAI_OAUTH_TOKEN_PATH=./data/xai_oauth.json
+export STELLA_DB_PATH=./data/stella.db
 stella serve
 ```
 

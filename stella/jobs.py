@@ -10,8 +10,6 @@ from stella.config import Settings
 from stella.errors import StellaError, normalize_e164
 from stella.store import CallJob, JobStore
 from stella.telnyx_client import TelnyxClient
-from stella.voice_provider import VoiceProviderChooser
-from stella.xai_auth import XAIAuth
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +20,10 @@ class JobService:
         settings: Settings,
         store: JobStore,
         telnyx: TelnyxClient,
-        xai: XAIAuth,
-        voice_chooser: VoiceProviderChooser | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.telnyx = telnyx
-        self.xai = xai
-        self.voice_chooser = voice_chooser or VoiceProviderChooser(settings, xai)
 
     def place_call(
         self,
@@ -43,8 +37,12 @@ class JobService:
         to_e164 = normalize_e164(to)
         if not (brief or "").strip():
             raise StellaError("Missing `brief` (task / script context).", "invalid_brief")
-        # One Grok realtime probe (or cache hit) for this job — sticky for the call.
-        provider = self.voice_chooser.choose()
+        if not (self.settings.gemini_api_key or "").strip():
+            raise StellaError(
+                "GEMINI_API_KEY is not set; Stella needs Gemini Live to place calls.",
+                "gemini_key_missing",
+            )
+        provider = "gemini"
         job = self.store.create(
             kind=kind,
             to_number=to_e164,

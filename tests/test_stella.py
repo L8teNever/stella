@@ -29,14 +29,8 @@ from stella.gemini_voice import (
     gemini_uses_thinking_level,
     gemini_ws_url,
 )
-from stella.voice import VoiceSession, build_instructions, job_wants_german, start_voice_bridge
-from stella.voice_provider import (
-    GROK_DOWN_CACHE_TTL_SECONDS,
-    VoiceProviderChooser,
-    default_grok_realtime_probe,
-)
+from stella.voice import TelnyxMediaGuard, build_instructions, job_wants_german, start_voice_bridge
 from stella.webhooks import verify_telnyx_signature
-from stella.xai_auth import XAIAuth
 
 
 class FakeTransport:
@@ -62,8 +56,7 @@ class FakeTransport:
 def make_settings(tmp_path, **kwargs) -> Settings:
     defaults = dict(
         stella_db_path=str(tmp_path / "stella.db"),
-        xai_oauth_token_path=str(tmp_path / "oauth.json"),
-        xai_api_key="test-xai-key",
+        gemini_api_key="test-gemini",
         telnyx_api_key="test-telnyx",
         telnyx_connection_id="conn-1",
         telnyx_from_number="+15551234567",
@@ -74,12 +67,6 @@ def make_settings(tmp_path, **kwargs) -> Settings:
     return Settings(**defaults)
 
 
-def make_chooser(settings, xai, grok_probe=None) -> VoiceProviderChooser:
-    return VoiceProviderChooser(
-        settings,
-        xai,
-        grok_probe=grok_probe if grok_probe is not None else (lambda token: None),
-    )
 
 
 def test_normalize_e164():
@@ -93,15 +80,14 @@ def test_place_call_dials_telnyx(tmp_path):
     store = JobStore(settings.stella_db_path)
     transport = FakeTransport()
     telnyx = TelnyxClient(settings, transport=transport)
-    xai = XAIAuth(settings)
-    svc = JobService(settings, store, telnyx, xai, voice_chooser=make_chooser(settings, xai))
+    svc = JobService(settings, store, telnyx)
     job = svc.place_call(
         to="+14155552671",
         brief="Reserve a table tomorrow 19:00 for 2, name Franz.",
         speak_to="the restaurant",
     )
     assert job.status == "dialing"
-    assert job.voice_provider == "grok"
+    assert job.voice_provider == "gemini"
     assert job.telnyx_call_control_id == "cc-test-1"
     method, url, kwargs = transport.calls[0]
     assert method == "POST"
@@ -115,13 +101,10 @@ def test_place_call_dials_telnyx(tmp_path):
 def test_place_call_fails_without_telnyx_config(tmp_path):
     settings = make_settings(tmp_path, telnyx_api_key="")
     store = JobStore(settings.stella_db_path)
-    xai = XAIAuth(settings)
     svc = JobService(
         settings,
         store,
         TelnyxClient(settings, FakeTransport()),
-        xai,
-        voice_chooser=make_chooser(settings, xai),
     )
     with pytest.raises(StellaError) as ei:
         svc.place_call(to="+14155552671", brief="hello")
@@ -129,33 +112,27 @@ def test_place_call_fails_without_telnyx_config(tmp_path):
     assert "TELNYX_API_KEY" in ei.value.message
 
 
-def test_place_call_fails_without_xai(tmp_path):
-    settings = make_settings(tmp_path, xai_api_key="")
+
+
+def test_place_call_fails_without_gemini_key(tmp_path):
+    settings = make_settings(tmp_path, gemini_api_key="")
     store = JobStore(settings.stella_db_path)
-    xai = XAIAuth(settings)
-    svc = JobService(
-        settings,
-        store,
-        TelnyxClient(settings, FakeTransport()),
-        xai,
-        voice_chooser=make_chooser(settings, xai),
-    )
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
     with pytest.raises(StellaError) as ei:
         svc.place_call(to="+14155552671", brief="hello")
-    assert ei.value.code == "voice_auth_missing"
+    assert ei.value.code == "gemini_key_missing"
     assert "GEMINI_API_KEY" in ei.value.message
+    assert transport.calls == []
 
 
-def test_place_call_allows_gemini_only(tmp_path):
-    settings = make_settings(tmp_path, xai_api_key="", gemini_api_key="test-gemini")
+def test_place_call_uses_gemini(tmp_path):
+    settings = make_settings(tmp_path)
     store = JobStore(settings.stella_db_path)
-    xai = XAIAuth(settings)
     svc = JobService(
         settings,
         store,
         TelnyxClient(settings, FakeTransport()),
-        xai,
-        voice_chooser=make_chooser(settings, xai),
     )
     job = svc.place_call(to="+14155552671", brief="hello")
     assert job.status == "dialing"
@@ -165,13 +142,10 @@ def test_place_call_allows_gemini_only(tmp_path):
 def test_webhook_updates_status(tmp_path):
     settings = make_settings(tmp_path)
     store = JobStore(settings.stella_db_path)
-    xai = XAIAuth(settings)
     svc = JobService(
         settings,
         store,
         TelnyxClient(settings, FakeTransport()),
-        xai,
-        voice_chooser=make_chooser(settings, xai),
     )
     job = svc.place_call(to="+14155552671", brief="Ask if Tuesday 10:00 still works.")
     svc.handle_telnyx_event(
@@ -219,16 +193,16 @@ def test_instructions_contain_only_job_context(tmp_path):
 
 
 def test_mcp_tools_registered(tmp_path):
-    settings = make_settings(tmp_path, xai_api_key="")
+    settings = make_settings(tmp_path)
     store = JobStore(settings.stella_db_path)
-    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()), XAIAuth(settings))
+    svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
     mcp = build_mcp(svc)
     names = {t.name for t in mcp._tool_manager.list_tools()}
     assert names == {"stella_call", "stella_call_status", "stella_briefing_call"}
 
 
 def test_health_and_call_http(tmp_path):
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, gemini_api_key="")
     app = create_app(settings)
     from fastapi.testclient import TestClient
 
@@ -236,12 +210,7 @@ def test_health_and_call_http(tmp_path):
     h = client.get("/health")
     assert h.status_code == 200
     body = h.json()
-    assert body["xai_auth"] == "api_key"
-    assert body["voice_provider"]["primary"] == "grok"
-    assert body["voice_provider"]["fallback"] == "gemini"
-    assert body["voice_provider"]["sticky"] == "per_call_job"
-    assert body["voice_provider"]["grok_down_cache_ttl_seconds"] == GROK_DOWN_CACHE_TTL_SECONDS
-    assert body["voice_provider"]["grok_down_cached"] is False
+    assert body["voice_provider"]["primary"] == "gemini"
     assert body["voice_provider"]["gemini"] == "none"
     assert body["gemini_configured"] is False
     # webhook without skip would 500; skip is on
@@ -320,55 +289,14 @@ class FakeTelnyxWS:
         self.sent.append(data)
 
 
-@pytest.mark.asyncio
-async def test_start_voice_bridge_uses_grok_when_locked(tmp_path):
-    settings = make_settings(tmp_path)
-    store = JobStore(settings.stella_db_path)
-    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
-    store.update(job.id, voice_provider="grok")
-    job = store.get(job.id)
-    grok_ws = FakeProviderWS()
-    seen: list[str] = []
-
-    async def grok_connect(url, headers):
-        assert "api.x.ai" in url
-        assert headers["Authorization"].startswith("Bearer ")
-        return grok_ws
-
-    async def gemini_connect(url, headers):
-        raise AssertionError("Gemini should not be used")
-
-    provider = await start_voice_bridge(
-        settings=settings,
-        job=job,
-        telnyx_ws=FakeTelnyxWS(),
-        grok_token_fn=lambda: "tok",
-        grok_connect=grok_connect,
-        hangup_cb=lambda: None,
-        transcript_cb=lambda c: None,
-        outcome_cb=lambda t: None,
-        provider_cb=seen.append,
-        gemini_connect=gemini_connect,
-        locked_provider="grok",
-    )
-    assert provider == "grok"
-    assert seen == ["grok"]
-    assert grok_ws.sent[0]["type"] == "session.update"
 
 
 @pytest.mark.asyncio
-async def test_start_voice_bridge_locked_gemini_skips_grok(tmp_path):
+async def test_start_voice_bridge_runs_gemini(tmp_path):
     settings = make_settings(tmp_path, gemini_api_key="g-key")
     store = JobStore(settings.stella_db_path)
     job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
     gemini_ws = FakeProviderWS([json.dumps({"setupComplete": {}})])
-    grok_hits: list[str] = []
-    seen: list[str] = []
-
-    async def grok_connect(url, headers):
-        grok_hits.append(url)
-        raise AssertionError("Grok must not be probed mid-call")
-
     async def gemini_connect(url, headers):
         assert "generativelanguage.googleapis.com" in url
         assert "g-key" in url
@@ -378,101 +306,27 @@ async def test_start_voice_bridge_locked_gemini_skips_grok(tmp_path):
         settings=settings,
         job=job,
         telnyx_ws=FakeTelnyxWS(),
-        grok_token_fn=lambda: "tok",
-        grok_connect=grok_connect,
         hangup_cb=lambda: None,
         transcript_cb=lambda c: None,
         outcome_cb=lambda t: None,
-        provider_cb=seen.append,
-        gemini_connect=gemini_connect,
-        locked_provider="gemini",
+        ws_connect=gemini_connect,
     )
     assert provider == "gemini"
-    assert seen == ["gemini"]
-    assert grok_hits == []
     voice = gemini_ws.sent[0]["setup"]["generationConfig"]["speechConfig"]["voiceConfig"][
         "prebuiltVoiceConfig"
     ]["voiceName"]
     assert voice == "Aoede"
 
 
-@pytest.mark.asyncio
-async def test_start_voice_bridge_locked_grok_does_not_fallback_on_403(tmp_path):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    store = JobStore(settings.stella_db_path)
-    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
-    gemini_hits = []
 
-    async def grok_connect(url, headers):
-        raise ConnectionError("HTTP 403 quota exceeded")
 
-    async def gemini_connect(url, headers):
-        gemini_hits.append(url)
-        raise AssertionError("must not fall back")
-
-    with pytest.raises(RuntimeError, match="Grok Voice"):
-        await start_voice_bridge(
-            settings=settings,
-            job=job,
-            telnyx_ws=FakeTelnyxWS(),
-            grok_token_fn=lambda: "tok",
-            grok_connect=grok_connect,
-            hangup_cb=lambda: None,
-            transcript_cb=lambda c: None,
-            outcome_cb=lambda t: None,
-            gemini_connect=gemini_connect,
-            locked_provider="grok",
-        )
-    assert gemini_hits == []
 
 
 @pytest.mark.asyncio
-async def test_start_voice_bridge_no_mid_call_gemini_after_grok_connect(tmp_path):
+async def test_start_voice_bridge_second_media_socket(tmp_path):
     settings = make_settings(tmp_path, gemini_api_key="g-key")
     store = JobStore(settings.stella_db_path)
     job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
-    gemini_hits: list[str] = []
-
-    class DroppingGrok(FakeProviderWS):
-        async def __anext__(self) -> str:
-            raise ConnectionError("Grok dropped mid-call")
-
-    grok_ws = DroppingGrok()
-
-    async def grok_connect(url, headers):
-        return grok_ws
-
-    async def gemini_connect(url, headers):
-        gemini_hits.append(url)
-        raise AssertionError("no mid-call Gemini")
-
-    with pytest.raises(ConnectionError, match="mid-call"):
-        await start_voice_bridge(
-            settings=settings,
-            job=job,
-            telnyx_ws=FakeTelnyxWS(),
-            grok_token_fn=lambda: "tok",
-            grok_connect=grok_connect,
-            hangup_cb=lambda: None,
-            transcript_cb=lambda c: None,
-            outcome_cb=lambda t: None,
-            gemini_connect=gemini_connect,
-            locked_provider="grok",
-        )
-    assert gemini_hits == []
-
-
-@pytest.mark.asyncio
-async def test_start_voice_bridge_second_media_socket_reuses_lock(tmp_path):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    store = JobStore(settings.stella_db_path)
-    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
-    grok_hits: list[int] = []
-
-    async def grok_connect(url, headers):
-        grok_hits.append(1)
-        raise AssertionError("locked gemini")
-
     async def gemini_connect(url, headers):
         return FakeProviderWS([json.dumps({"setupComplete": {}})])
 
@@ -481,16 +335,12 @@ async def test_start_voice_bridge_second_media_socket_reuses_lock(tmp_path):
             settings=settings,
             job=job,
             telnyx_ws=FakeTelnyxWS(),
-            grok_token_fn=lambda: "tok",
-            grok_connect=grok_connect,
-            hangup_cb=lambda: None,
+                hangup_cb=lambda: None,
             transcript_cb=lambda c: None,
             outcome_cb=lambda t: None,
-            gemini_connect=gemini_connect,
-            locked_provider="gemini",
+            ws_connect=gemini_connect,
         )
         assert provider == "gemini"
-    assert grok_hits == []
 
 
 @pytest.mark.asyncio
@@ -504,12 +354,10 @@ async def test_start_voice_bridge_errors_when_gemini_key_missing(tmp_path):
             settings=settings,
             job=job,
             telnyx_ws=FakeTelnyxWS(),
-            grok_token_fn=lambda: "tok",
-            grok_connect=lambda u, h: None,
+            ws_connect=lambda u, h: None,
             hangup_cb=lambda: None,
             transcript_cb=lambda c: None,
             outcome_cb=lambda t: None,
-            locked_provider="gemini",
         )
 
 
@@ -644,7 +492,6 @@ def test_pcmu_24k_emits_aligned_20ms_frames():
 def test_gemini_voice_default_is_female(tmp_path):
     settings = make_settings(tmp_path)
     assert settings.gemini_voice == "Aoede"
-    assert settings.xai_voice == "eve"
 
 
 def test_dial_keeps_inbound_track_for_bidirectional(tmp_path):
@@ -652,8 +499,7 @@ def test_dial_keeps_inbound_track_for_bidirectional(tmp_path):
     store = JobStore(settings.stella_db_path)
     transport = FakeTransport()
     telnyx = TelnyxClient(settings, transport=transport)
-    xai = XAIAuth(settings)
-    svc = JobService(settings, store, telnyx, xai, voice_chooser=make_chooser(settings, xai))
+    svc = JobService(settings, store, telnyx)
     svc.place_call(to="+14155552671", brief="hello")
     payload = transport.calls[0][2]["json"]
     assert payload["stream_track"] == "inbound_track"
@@ -671,104 +517,16 @@ def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):
     assert "preview-09-2025" not in DEFAULT_GEMINI_LIVE_MODEL
 
 
-def test_chooser_probes_grok_once_then_caches_403(tmp_path):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    xai = XAIAuth(settings)
-    probes: list[str] = []
-    clock = {"t": 0.0}
-
-    def probe(token: str) -> None:
-        probes.append(token)
-        raise ConnectionError("HTTP 403 quota exceeded")
-
-    chooser = VoiceProviderChooser(
-        settings,
-        xai,
-        grok_probe=probe,
-        clock=lambda: clock["t"],
-        down_ttl_seconds=300,
-    )
-    assert chooser.choose() == "gemini"
-    assert chooser.choose() == "gemini"
-    assert probes == ["test-xai-key"]
-    assert chooser.grok_down_cached()
-    clock["t"] = 299
-    assert chooser.choose() == "gemini"
-    assert probes == ["test-xai-key"]
-    clock["t"] = 300
-    assert chooser.choose() == "gemini"
-    assert probes == ["test-xai-key", "test-xai-key"]
 
 
-def test_place_call_uses_cached_gemini_without_second_probe(tmp_path):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    store = JobStore(settings.stella_db_path)
-    transport = FakeTransport()
-    telnyx = TelnyxClient(settings, transport=transport)
-    xai = XAIAuth(settings)
-    probes: list[int] = []
-
-    def probe(token: str) -> None:
-        probes.append(1)
-        raise ConnectionError("HTTP 403")
-
-    chooser = VoiceProviderChooser(settings, xai, grok_probe=probe)
-    svc = JobService(settings, store, telnyx, xai, voice_chooser=chooser)
-    a = svc.place_call(to="+14155552671", brief="first")
-    b = svc.place_call(to="+14155552671", brief="second")
-    assert a.voice_provider == "gemini"
-    assert b.voice_provider == "gemini"
-    assert probes == [1]
 
 
-def test_chooser_uses_grok_when_probe_ok(tmp_path):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    xai = XAIAuth(settings)
-    chooser = VoiceProviderChooser(settings, xai, grok_probe=lambda t: None)
-    assert chooser.choose() == "grok"
 
 
-class _FakeSyncWS:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
 
 
-def test_default_grok_probe_sync_and_running_loop(tmp_path, monkeypatch):
-    """MCP/FastAPI already has a loop; probe must not use asyncio.run()."""
-    settings = make_settings(tmp_path)
-    seen: list[str] = []
-
-    def fake_connect(url, **kwargs):
-        seen.append(url)
-        assert kwargs["additional_headers"]["Authorization"] == "Bearer tok"
-        return _FakeSyncWS()
-
-    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
-
-    default_grok_realtime_probe(settings, "tok")
-    assert seen
-
-    async def from_mcp():
-        default_grok_realtime_probe(settings, "tok")
-
-    asyncio.run(from_mcp())
-    assert len(seen) == 2
 
 
-def test_chooser_default_probe_from_async_does_not_mark_down(tmp_path, monkeypatch):
-    settings = make_settings(tmp_path, gemini_api_key="g-key")
-    xai = XAIAuth(settings)
-    monkeypatch.setattr("websockets.sync.client.connect", lambda *a, **k: _FakeSyncWS())
-    chooser = VoiceProviderChooser(settings, xai)
-
-    async def mcp_place():
-        return chooser.choose()
-
-    assert asyncio.run(mcp_place()) == "grok"
-    assert chooser.grok_down_cached() is None
 
 
 @pytest.mark.asyncio
@@ -864,13 +622,10 @@ async def test_gemini_kickoff_waits_for_stream_start(tmp_path):
         settings=settings,
         job=job,
         telnyx_ws=telnyx,
-        grok_token_fn=lambda: "tok",
-        grok_connect=lambda u, h: None,
         hangup_cb=lambda: None,
         transcript_cb=lambda c: None,
         outcome_cb=lambda t: None,
-        gemini_connect=gemini_connect,
-        locked_provider="gemini",
+        ws_connect=gemini_connect,
     )
     assert not any(isinstance(m, dict) and "clientContent" in m for m in gemini_ws.sent)
 
@@ -893,69 +648,16 @@ async def test_gemini_kickoff_after_telnyx_start(tmp_path):
         settings=settings,
         job=job,
         telnyx_ws=telnyx,
-        grok_token_fn=lambda: "tok",
-        grok_connect=lambda u, h: None,
         hangup_cb=lambda: None,
         transcript_cb=lambda c: None,
         outcome_cb=lambda t: None,
-        gemini_connect=gemini_connect,
-        locked_provider="gemini",
+        ws_connect=gemini_connect,
     )
     assert any(isinstance(m, dict) and "clientContent" in m for m in gemini_ws.sent)
 
 
-@pytest.mark.asyncio
-async def test_grok_kickoff_after_telnyx_start(tmp_path):
-    settings = make_settings(tmp_path)
-    store = JobStore(settings.stella_db_path)
-    job = store.create(kind="call", to_number="+14155552671", brief="Book a table.")
-    grok_ws = FakeProviderWS(hold_open=True)
-    telnyx = FakeTelnyxWS(texts=[json.dumps({"event": "start"})], linger_s=0.15)
-
-    async def grok_connect(url, headers):
-        return grok_ws
-
-    await start_voice_bridge(
-        settings=settings,
-        job=job,
-        telnyx_ws=telnyx,
-        grok_token_fn=lambda: "tok",
-        grok_connect=grok_connect,
-        hangup_cb=lambda: None,
-        transcript_cb=lambda c: None,
-        outcome_cb=lambda t: None,
-        locked_provider="grok",
-    )
-    types = [m.get("type") for m in grok_ws.sent if isinstance(m, dict)]
-    assert "session.update" in types
-    assert "conversation.item.create" in types
-    assert "response.create" in types
 
 
-@pytest.mark.asyncio
-async def test_voice_session_hangup_waits_for_outbound(tmp_path):
-    settings = make_settings(tmp_path)
-    store = JobStore(settings.stella_db_path)
-    job = store.create(kind="call", to_number="+14155552671", brief="x")
-    hung: list[int] = []
-
-    async def hangup():
-        hung.append(1)
-
-    session = VoiceSession(
-        settings=settings,
-        job=job,
-        bearer_token="t",
-        grok_connect=lambda u, h: None,
-        hangup_cb=hangup,
-        transcript_cb=lambda c: None,
-        outcome_cb=lambda t: None,
-    )
-    session.guard.hangup_wait_audio_s = 0.2
-    session.guard.hangup_playout_pad_s = 0.0
-    session.guard.mark_started()
-    await session.guard.hangup_after_audio(hangup, lambda: False)
-    assert hung == [1]
 
 
 def test_gemini_setup_includes_phone_vad(tmp_path):
@@ -1275,3 +977,28 @@ async def test_gemini_setup_falls_back_to_next_live_model(tmp_path):
     assert models[1] == "models/gemini-3.1-flash-live-preview"
     assert session._active_model == "gemini-3.1-flash-live-preview"
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_hangup_guard_waits_for_outbound():
+    hung: list[int] = []
+
+    async def hangup():
+        hung.append(1)
+
+    guard = TelnyxMediaGuard(hangup_wait_audio_s=0.2, hangup_playout_pad_s=0.0)
+    guard.mark_started()
+    await guard.hangup_after_audio(hangup, lambda: False)
+    assert hung == [1]
+
+
+def test_mcp_token_protects_mcp_and_calls(tmp_path):
+    settings = make_settings(tmp_path, stella_mcp_token="s3cret")
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(settings))
+    assert client.get("/health").status_code == 200
+    assert client.get("/calls/x").status_code == 401
+    assert client.get("/calls/x?Token=wrong").status_code == 401
+    assert client.get("/calls/x?Token=s3cret").status_code == 404
+    assert client.get("/calls/x", headers={"Authorization": "Bearer s3cret"}).status_code == 404

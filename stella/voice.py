@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import audioop
 import base64
 import json
 import logging
@@ -14,7 +13,7 @@ from stella.store import CallJob
 logger = logging.getLogger(__name__)
 
 # Telnyx RTP: 20 ms per 160-byte PCMU frame. Hang up only after the stream is
-# live and queued outbound audio has had time to play — otherwise Gemini/Grok
+# live and queued outbound audio has had time to play — otherwise Gemini
 # can complete (and call hang_up) during setup/ringing with 0 packets out.
 TELNYX_PCMU_FRAME_MS = 20
 TELNYX_PCMU_FRAME_BYTES = 160
@@ -252,284 +251,26 @@ class FarewellHangupWatch:
         self._arm("Call ended after farewell.")
 
 
-class VoiceSession:
-    """Bridge Telnyx media WebSocket <-> xAI Grok Voice realtime WebSocket."""
-
-    def __init__(
-        self,
-        *,
-        settings: Settings,
-        job: CallJob,
-        bearer_token: str,
-        grok_connect,
-        hangup_cb,
-        transcript_cb,
-        outcome_cb,
-    ) -> None:
-        self.settings = settings
-        self.job = job
-        self.bearer_token = bearer_token
-        self._grok_connect = grok_connect
-        self._hangup = hangup_cb
-        self._transcript = transcript_cb
-        self._outcome = outcome_cb
-        self._telnyx_ws = None
-        self._grok_ws = None
-        self._closed = False
-        self._assistant_bits: list[str] = []
-        self.provider = "grok"
-        self.guard = TelnyxMediaGuard()
-        self._farewell = FarewellHangupWatch(
-            enabled=bool(settings.stella_farewell_hangup),
-            delay_s=settings.stella_farewell_hangup_s,
-            arm=self._arm_hangup_from_farewell,
-        )
-
-    async def attach_telnyx(self, telnyx_ws) -> None:
-        self._telnyx_ws = telnyx_ws
-        await self.connect()
-        await self.run()
-
-    async def connect(self) -> None:
-        url = f"{self.settings.xai_realtime_url}?model={self.settings.xai_voice_model}"
-        headers = {"Authorization": f"Bearer {self.bearer_token}"}
-        try:
-            self._grok_ws = await self._grok_connect(url, headers)
-        except Exception as exc:
-            logger.exception("Grok Voice connect failed")
-            await self._send_telnyx_clear()
-            raise RuntimeError(f"Could not open Grok Voice session: {exc}") from exc
-
-        await self._grok_ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "voice": self.settings.xai_voice,
-                        "instructions": build_instructions(self.job),
-                        "turn_detection": {"type": "server_vad"},
-                        "audio": {
-                            "input": {"format": {"type": "audio/pcmu", "rate": 8000}},
-                            "output": {"format": {"type": "audio/pcmu", "rate": 8000}},
-                        },
-                        "tools": [hang_up_tool_openai()],
-                    },
-                }
-            )
-        )
-        # Kickoff waits for Telnyx stream start so the model does not "complete"
-        # (and hang_up) during ringing before any RTP can flow.
-
-    async def _send_kickoff(self) -> None:
-        assert self._grok_ws is not None
-        await self._grok_ws.send(
-            json.dumps(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": KICKOFF_TEXT,
-                            }
-                        ],
-                    },
-                }
-            )
-        )
-        await self._grok_ws.send(json.dumps({"type": "response.create"}))
-
-    async def run(self) -> None:
-        await asyncio.gather(
-            self._pump_telnyx(),
-            self._pump_grok(),
-            self.guard.kickoff_once(lambda: self._closed, self._send_kickoff),
-        )
-
-    async def _pump_telnyx(self) -> None:
-        assert self._telnyx_ws is not None
-        try:
-            async for raw in self._telnyx_ws.iter_text():
-                if self._closed:
-                    break
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                event = msg.get("event")
-                if event in {"start", "media"}:
-                    self.guard.mark_started()
-                if event == "media":
-                    media = msg.get("media") or {}
-                    track = (media.get("track") or "").lower()
-                    if track in {"outbound", "outbound_track"}:
-                        continue
-                    payload = media.get("payload") or media.get("chunk")
-                    if payload and self._grok_ws:
-                        try:
-                            ulaw = base64.b64decode(payload)
-                            rms = audioop.rms(audioop.ulaw2lin(ulaw, 2), 2) if ulaw else 0
-                        except Exception:
-                            rms = 0
-                        if rms >= int(self.settings.stella_client_vad_rms):
-                            self._farewell.note_user_speech()
-                        await self._grok_ws.send(
-                            json.dumps(
-                                {
-                                    "type": "input_audio_buffer.append",
-                                    "audio": payload,
-                                }
-                            )
-                        )
-                elif event in {"stop", "closed"}:
-                    break
-        finally:
-            await self.close()
-
-    async def _pump_grok(self) -> None:
-        assert self._grok_ws is not None
-        try:
-            async for raw in self._grok_ws:
-                if self._closed:
-                    break
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8", errors="replace")
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                await self._handle_grok_event(event)
-        finally:
-            await self.close()
-
-    async def _handle_grok_event(self, event: dict[str, Any]) -> None:
-        etype = event.get("type") or ""
-        if etype == "response.output_audio.delta":
-            delta = event.get("delta")
-            if delta:
-                await self.guard.send_outbound_pcmu(self._telnyx_ws, delta)
-        elif etype in {"response.output_text.delta", "response.audio_transcript.delta"}:
-            piece = event.get("delta") or ""
-            if piece:
-                self._assistant_bits.append(piece)
-                self._transcript(piece)
-                self._farewell.note_assistant_text(piece)
-        elif etype == "response.output_item.done":
-            item = event.get("item") or {}
-            if item.get("type") == "function_call" and item.get("name") == "hang_up":
-                outcome = parse_hang_up_args(item.get("arguments") or "{}")
-                self._outcome(outcome)
-                if self._grok_ws:
-                    await self._grok_ws.send(
-                        json.dumps(
-                            {
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "function_call_output",
-                                    "call_id": item.get("call_id"),
-                                    "output": "hanging up",
-                                },
-                            }
-                        )
-                    )
-                self.guard.arm_hangup(self._deferred_hangup)
-        elif etype == "error":
-            logger.error("Grok Voice error: %s", event)
-
-    def _arm_hangup_from_farewell(self, outcome: str) -> None:
-        if self._closed:
-            return
-        self._outcome(outcome)
-        self.guard.arm_hangup(self._deferred_hangup)
-
-    async def _deferred_hangup(self) -> None:
-        try:
-            await self.guard.hangup_after_audio(self._hangup, lambda: self._closed)
-        finally:
-            await self.close()
-
-    async def _send_telnyx_clear(self) -> None:
-        if self._telnyx_ws:
-            try:
-                await self._telnyx_ws.send_text(json.dumps({"event": "clear"}))
-            except Exception:
-                pass
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self.guard.mark_started()
-        for ws in (self._grok_ws,):
-            if ws is None:
-                continue
-            try:
-                await ws.close()
-            except Exception:
-                pass
-
-
 async def start_voice_bridge(
     *,
     settings: Settings,
     job: CallJob,
     telnyx_ws,
-    grok_token_fn: Callable[[], str],
-    grok_connect,
+    ws_connect,
     hangup_cb,
     transcript_cb,
     outcome_cb,
-    provider_cb: Callable[[str], None] | None = None,
-    gemini_connect=None,
-    locked_provider: str | None = None,
 ) -> str:
-    """Run the already-chosen voice provider for this job.
-
-    ``locked_provider`` is the sticky choice from MCP (`grok` or `gemini`).
-    Connect and media pumps use only that provider. A mid-session Grok drop
-    does **not** open Gemini (and vice versa). If unset, falls back to the
-    job's stored ``voice_provider``.
-    """
+    """Run the Gemini Live bridge for this job."""
     from stella.gemini_voice import GeminiVoiceSession
 
-    provider = (locked_provider or job.voice_provider or "").strip().lower()
-    if provider not in {"grok", "gemini"}:
-        raise RuntimeError(
-            "Voice provider was not selected for this call. "
-            "MCP place_call must choose grok or gemini before media starts."
-        )
-
-    if provider_cb:
-        provider_cb(provider)
-
-    if provider == "grok":
-        token = grok_token_fn()
-        session = VoiceSession(
-            settings=settings,
-            job=job,
-            bearer_token=token,
-            grok_connect=grok_connect,
-            hangup_cb=hangup_cb,
-            transcript_cb=transcript_cb,
-            outcome_cb=outcome_cb,
-        )
-        session._telnyx_ws = telnyx_ws
-        await session.connect()
-        await session.run()
-        return "grok"
-
-    gemini_key = (settings.gemini_api_key or "").strip()
-    if not gemini_key:
-        raise RuntimeError(
-            "This call is locked to Gemini Live but GEMINI_API_KEY is not set."
-        )
+    if not (settings.gemini_api_key or "").strip():
+        raise RuntimeError("GEMINI_API_KEY is not set.")
 
     gem = GeminiVoiceSession(
         settings=settings,
         job=job,
-        gemini_connect=gemini_connect or grok_connect,
+        gemini_connect=ws_connect,
         hangup_cb=hangup_cb,
         transcript_cb=transcript_cb,
         outcome_cb=outcome_cb,

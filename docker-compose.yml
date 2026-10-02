@@ -10,7 +10,6 @@ services:
         required: false
     environment:
       STELLA_DB_PATH: /data/stella.db
-      XAI_OAUTH_TOKEN_PATH: /data/xai_oauth.json
     volumes:
       - stella-data:/data
     healthcheck:

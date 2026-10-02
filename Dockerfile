@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir .
 RUN mkdir -p /data
 
 ENV STELLA_DB_PATH=/data/stella.db \
-    XAI_OAUTH_TOKEN_PATH=/data/xai_oauth.json \
     STELLA_HOST=0.0.0.0 \
     STELLA_PORT=8080
 

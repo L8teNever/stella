@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -14,11 +15,21 @@ from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.voice import start_voice_bridge
-from stella.voice_provider import GROK_DOWN_CACHE_TTL_SECONDS, VoiceProviderChooser
 from stella.webhooks import verify_telnyx_signature
-from stella.xai_auth import XAIAuth
 
 logger = logging.getLogger("stella")
+
+
+def _token_ok(request: Request, expected: str) -> bool:
+    if not expected:
+        return True
+    auth = request.headers.get("authorization") or ""
+    bearer = f"Bearer {expected}"
+    q = request.query_params.get("Token") or request.query_params.get("token") or ""
+    try:
+        return secrets.compare_digest(auth, bearer) or secrets.compare_digest(q, expected)
+    except ValueError:
+        return False
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -26,9 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings.data_dir()
     store = JobStore(settings.stella_db_path)
     telnyx = TelnyxClient(settings)
-    xai = XAIAuth(settings)
-    voice_chooser = VoiceProviderChooser(settings, xai)
-    jobs = JobService(settings, store, telnyx, xai, voice_chooser=voice_chooser)
+    jobs = JobService(settings, store, telnyx)
     mcp = build_mcp(jobs)
     mcp_asgi = mcp.streamable_http_app()
 
@@ -42,7 +51,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.store = store
     app.state.jobs = jobs
-    app.state.xai = xai
     app.state.mcp = mcp
 
     @app.get("/health")
@@ -50,14 +58,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "ok": True,
             "service": "stella",
-            "xai_auth": xai.auth_mode(),
             "voice_provider": {
-                "primary": "grok",
-                "fallback": "gemini",
-                "sticky": "per_call_job",
-                "grok_down_cache_ttl_seconds": GROK_DOWN_CACHE_TTL_SECONDS,
-                "grok_down_cached": bool(voice_chooser.grok_down_cached()),
-                "grok": xai.auth_mode(),
+                "primary": "gemini",
                 "gemini": "api_key" if (settings.gemini_api_key or "").strip() else "none",
             },
             "gemini_configured": bool((settings.gemini_api_key or "").strip()),
@@ -108,40 +110,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data["events"] = store.events(job.id)
         return data
 
-    @app.post("/oauth/xai/start")
-    def oauth_start():
-        login = xai.start_device_login()
-        return {
-            "user_code": login.user_code,
-            "verification_uri": login.verification_uri,
-            "verification_uri_complete": login.verification_uri_complete,
-            "device_code": login.device_code,
-            "interval": login.interval,
-            "expires_in": login.expires_in,
-            "message": "Open verification_uri, approve access, then POST /oauth/xai/poll with device_code.",
-        }
-
-    @app.post("/oauth/xai/poll")
-    def oauth_poll(payload: dict):
-        from stella.xai_auth import DeviceLogin
-
-        device_code = payload.get("device_code")
-        if not device_code:
-            raise HTTPException(status_code=400, detail="device_code required")
-        login = DeviceLogin(
-            device_code=device_code,
-            user_code="",
-            verification_uri="",
-            verification_uri_complete="",
-            interval=int(payload.get("interval") or 5),
-            expires_in=int(payload.get("expires_in") or 90),
-        )
-        try:
-            tokens = xai.poll_device_login(login, max_wait=int(payload.get("max_wait") or 90))
-        except StellaError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        return {"ok": True, "token_type": tokens.get("token_type", "Bearer")}
-
     @app.websocket("/media/{job_id}")
     async def media(websocket: WebSocket, job_id: str):
         await websocket.accept()
@@ -161,34 +129,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if current:
                 jobs.hangup(current)
 
-        async def grok_connect(url: str, headers: dict):
+        async def ws_connect(url: str, headers: dict):
             import websockets
 
             return await websockets.connect(url, additional_headers=headers or None)
-
-        def provider_cb(name: str) -> None:
-            store.update(job_id, voice_provider=name)
-
-        locked = (job.voice_provider or "").strip().lower()
-        if locked not in {"grok", "gemini"}:
-            # Job created before sticky selection; choose once and persist.
-            locked = jobs.voice_chooser.choose()
-            store.update(job_id, voice_provider=locked)
-            job = store.get(job_id) or job
 
         try:
             await start_voice_bridge(
                 settings=settings,
                 job=job,
                 telnyx_ws=websocket,
-                grok_token_fn=xai.bearer_token,
-                grok_connect=grok_connect,
+                ws_connect=ws_connect,
                 hangup_cb=hangup_cb,
                 transcript_cb=transcript_cb,
                 outcome_cb=outcome_cb,
-                provider_cb=provider_cb,
-                gemini_connect=grok_connect,
-                locked_provider=locked,
             )
         except WebSocketDisconnect:
             pass
@@ -197,12 +151,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.update(job_id, status="failed", error=str(exc)[:2000] or "voice session failed")
 
     @app.middleware("http")
-    async def mcp_auth_middleware(request: Request, call_next):
-        if request.url.path.startswith("/mcp") and settings.stella_mcp_token:
-            auth = request.headers.get("authorization") or ""
-            expected = f"Bearer {settings.stella_mcp_token}"
-            if auth != expected:
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
+    async def normalize_mcp_case(request: Request, call_next):
+        path = request.scope.get("path") or ""
+        if path.startswith("/MCP"):
+            request.scope["path"] = "/mcp" + path[4:]
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def admin_auth_middleware(request: Request, call_next):
+        path = (request.scope.get("path") or "").lower()
+        needs = path.startswith("/mcp") or path.startswith("/calls")
+        if needs and settings.stella_mcp_token and not _token_ok(request, settings.stella_mcp_token):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
     app.mount("/mcp", mcp_asgi)

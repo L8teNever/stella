@@ -158,9 +158,11 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
     return {
         "name": "frag_ida",
         "description": (
-            "Fragt Simons persönliche Daten ab: Kalendertermine, Stundenplan und Ausfälle, "
-            "Hausaufgaben, Mails (nur lesen), Smart-Home-Status. Nicht für Allgemeinwissen. "
-            "Dauert einige Sekunden. Vorher kurz sagen, dass du nachschaust."
+            "Zugriff auf Simons Dienste (Kalender, Stundenplan und Ausfälle, Hausaufgaben, "
+            "Mails, Aufgaben, Kontakte, Smart Home, Erinnerungen, Notizen/Memory, Dokumente). "
+            "Lesen geht direkt; Aktionen (Termin eintragen, Mail senden, Licht schalten, "
+            "Erinnerung setzen ...) erst nach seinem ausdrücklichen Ja. Nicht für "
+            "Allgemeinwissen. Dauert einige Sekunden. Vorher kurz sagen, dass du nachschaust."
         ),
         "parameters": {
             "type": "OBJECT",

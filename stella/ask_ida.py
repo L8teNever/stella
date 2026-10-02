@@ -101,8 +101,9 @@ def build_system_prompt(confirmed: bool, now: datetime | None = None) -> str:
             "Aktion aus, falls dir ein passendes Tool erlaubt ist, und bestätige in einem Satz."
         )
     return base + (
-        "Du darfst nur lesen, nie etwas ändern, senden oder schalten. Verlangt die Frage eine "
-        "solche Aktion, führe sie NICHT aus: beschreibe in einem Satz, was du tun würdest, und "
+        "Nutze nur die dir bereitgestellten Tools. Verlangt die Frage eine Aktion, die etwas "
+        "ändert, sendet oder schaltet, und dir ist dafür kein Tool erlaubt, führe sie NICHT aus: "
+        "beschreibe in einem Satz, was du tun würdest, und "
         f"hänge exakt das Wort {NEEDS_CONFIRMATION} an."
     )
 

@@ -14,9 +14,7 @@ from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
 from stella.voice import start_voice_bridge
-from stella.voice_provider import GROK_DOWN_CACHE_TTL_SECONDS, VoiceProviderChooser
 from stella.webhooks import verify_telnyx_signature
-from stella.xai_auth import XAIAuth
 
 logger = logging.getLogger("stella")
 
@@ -26,9 +24,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings.data_dir()
     store = JobStore(settings.stella_db_path)
     telnyx = TelnyxClient(settings)
-    xai = XAIAuth(settings)
-    voice_chooser = VoiceProviderChooser(settings, xai)
-    jobs = JobService(settings, store, telnyx, xai, voice_chooser=voice_chooser)
+    jobs = JobService(settings, store, telnyx)
     mcp = build_mcp(jobs)
     mcp_asgi = mcp.streamable_http_app()
 
@@ -42,7 +38,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.store = store
     app.state.jobs = jobs
-    app.state.xai = xai
     app.state.mcp = mcp
 
     @app.get("/health")
@@ -50,14 +45,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "ok": True,
             "service": "stella",
-            "xai_auth": xai.auth_mode(),
             "voice_provider": {
-                "primary": "grok",
-                "fallback": "gemini",
-                "sticky": "per_call_job",
-                "grok_down_cache_ttl_seconds": GROK_DOWN_CACHE_TTL_SECONDS,
-                "grok_down_cached": bool(voice_chooser.grok_down_cached()),
-                "grok": xai.auth_mode(),
+                "primary": "gemini",
                 "gemini": "api_key" if (settings.gemini_api_key or "").strip() else "none",
             },
             "gemini_configured": bool((settings.gemini_api_key or "").strip()),
@@ -108,40 +97,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data["events"] = store.events(job.id)
         return data
 
-    @app.post("/oauth/xai/start")
-    def oauth_start():
-        login = xai.start_device_login()
-        return {
-            "user_code": login.user_code,
-            "verification_uri": login.verification_uri,
-            "verification_uri_complete": login.verification_uri_complete,
-            "device_code": login.device_code,
-            "interval": login.interval,
-            "expires_in": login.expires_in,
-            "message": "Open verification_uri, approve access, then POST /oauth/xai/poll with device_code.",
-        }
-
-    @app.post("/oauth/xai/poll")
-    def oauth_poll(payload: dict):
-        from stella.xai_auth import DeviceLogin
-
-        device_code = payload.get("device_code")
-        if not device_code:
-            raise HTTPException(status_code=400, detail="device_code required")
-        login = DeviceLogin(
-            device_code=device_code,
-            user_code="",
-            verification_uri="",
-            verification_uri_complete="",
-            interval=int(payload.get("interval") or 5),
-            expires_in=int(payload.get("expires_in") or 90),
-        )
-        try:
-            tokens = xai.poll_device_login(login, max_wait=int(payload.get("max_wait") or 90))
-        except StellaError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        return {"ok": True, "token_type": tokens.get("token_type", "Bearer")}
-
     @app.websocket("/media/{job_id}")
     async def media(websocket: WebSocket, job_id: str):
         await websocket.accept()
@@ -161,34 +116,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if current:
                 jobs.hangup(current)
 
-        async def grok_connect(url: str, headers: dict):
+        async def ws_connect(url: str, headers: dict):
             import websockets
 
             return await websockets.connect(url, additional_headers=headers or None)
-
-        def provider_cb(name: str) -> None:
-            store.update(job_id, voice_provider=name)
-
-        locked = (job.voice_provider or "").strip().lower()
-        if locked not in {"grok", "gemini"}:
-            # Job created before sticky selection; choose once and persist.
-            locked = jobs.voice_chooser.choose()
-            store.update(job_id, voice_provider=locked)
-            job = store.get(job_id) or job
 
         try:
             await start_voice_bridge(
                 settings=settings,
                 job=job,
                 telnyx_ws=websocket,
-                grok_token_fn=xai.bearer_token,
-                grok_connect=grok_connect,
+                ws_connect=ws_connect,
                 hangup_cb=hangup_cb,
                 transcript_cb=transcript_cb,
                 outcome_cb=outcome_cb,
-                provider_cb=provider_cb,
-                gemini_connect=grok_connect,
-                locked_provider=locked,
             )
         except WebSocketDisconnect:
             pass

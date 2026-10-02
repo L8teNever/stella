@@ -5,14 +5,13 @@ from stella.jobs import JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
-from stella.xai_auth import XAIAuth
 
 
 def main() -> None:
     settings = get_settings()
     settings.data_dir()
     store = JobStore(settings.stella_db_path)
-    jobs = JobService(settings, store, TelnyxClient(settings), XAIAuth(settings))
+    jobs = JobService(settings, store, TelnyxClient(settings))
     mcp = build_mcp(jobs)
     mcp.run(transport="stdio")
 

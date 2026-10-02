@@ -25,13 +25,6 @@ class Settings(BaseSettings):
     telnyx_public_key: str = ""
     telnyx_api_base: str = "https://api.telnyx.com/v2"
 
-    xai_api_key: str = ""
-    xai_voice_model: str = "grok-voice-latest"
-    xai_voice: str = "eve"
-    xai_oauth_token_path: str = "/data/xai_oauth.json"
-    xai_oauth_client_id: str = "b1a00492-073a-47ea-816f-4c329264a828"
-    xai_realtime_url: str = "wss://api.x.ai/v1/realtime"
-
     gemini_api_key: str = ""
     # Official Gemini Live native-audio id (BidiGenerateContent). Override with GEMINI_LIVE_MODEL.
     # Do not default to gemini-3.8-live-extended-thinking (phone latency).
@@ -65,8 +58,6 @@ class Settings(BaseSettings):
     def data_dir(self) -> Path:
         p = Path(self.stella_db_path).parent
         p.mkdir(parents=True, exist_ok=True)
-        token_parent = Path(self.xai_oauth_token_path).parent
-        token_parent.mkdir(parents=True, exist_ok=True)
         return p
 
     def public_http_url(self, path: str) -> str:

@@ -68,7 +68,7 @@ The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5
 On a call to the **owner number**, Gemini can look up Simon’s personal data (calendar, timetable, homework, mail read-only, smart-home status) via the function tool `frag_ida`:
 
 1. Simon asks; Gemini says “Moment, ich schau nach” and calls `frag_ida(frage, bestaetigt?)`.
-2. Stella runs Claude Code headless (`claude -p`, model `ASK_IDA_MODEL`, default `haiku`) in the container with only the MCP servers from `ASK_IDA_MCP_CONFIG` (`--strict-mcp-config`). Built-in tools (shell, files, web) are off; the question goes in via stdin, never through a shell.
+2. Stella runs Claude Code headless (`claude -p`, model `ASK_IDA_MODEL`, default `sonnet`) in the container with only the MCP servers from `ASK_IDA_MCP_CONFIG` (`--strict-mcp-config`). Built-in tools (shell, files, web) are off; the question goes in via stdin, never through a shell.
 3. Claude answers in 1–3 spoken German sentences; the text (max 600 chars) goes back to Gemini as the tool result and Gemini says it.
 
 The call is handled in a background task, so audio, VAD, hang-up and farewell guards keep running. `gemini-3.8-live` is not documented to support non-blocking function calls (only 2.5 Flash Live is), so Stella uses the default blocking behaviour and relies on Gemini announcing the lookup before the call.
@@ -86,7 +86,7 @@ The call is handled in a background task, so audio, VAD, hang-up and farewell gu
 2. In `.env`: `ASK_IDA_ENABLED=true`, `STELLA_OWNER_NUMBER=+49…`, `ASK_IDA_ALLOWED_TOOLS=mcp__Ida_Untis__stundenplan,…`, and Claude Code auth: `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), plus `IDA_MCP_TOKEN`.
 3. `docker compose up -d --build` (the image installs Node + Claude Code, version pinned in the `Dockerfile`; `HOME`/`CLAUDE_CONFIG_DIR` live under `/data`).
 
-**Latency:** a lookup takes several seconds (Claude start + MCP + model; ~4–6 s measured locally with haiku and one tool). With `STELLA_LATENCY_LOG=true`, Stella logs `stella_latency ask_ida_ms ms=<n>`. Timeout: `ASK_IDA_TIMEOUT_S` (default 25 s).
+**Latency:** a lookup takes several seconds (Claude start + MCP + model; ~4–6 s measured locally with one tool). With `STELLA_LATENCY_LOG=true`, Stella logs `stella_latency ask_ida_ms ms=<n>`. Timeout: `ASK_IDA_TIMEOUT_S` (default 25 s).
 
 ## Telnyx
 

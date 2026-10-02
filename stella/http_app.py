@@ -151,8 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             plan = jobs.plan_task(job, args)
             callback_bg.start(settings, plan)
             run_at = plan["run_at"].astimezone(BERLIN)
-            return {"result": f"Okay, die Aufgabe für {run_at:%H:%M} Uhr wird im Hintergrund "
-                    "eingerichtet. Bestätige Simon die Uhrzeit sofort."}
+            return {"result": f"Eingeplant für {run_at:%H:%M} Uhr."}
 
         try:
             await start_voice_bridge(

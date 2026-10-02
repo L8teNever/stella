@@ -256,6 +256,7 @@ class GeminiVoiceSession:
     ) -> None:
         self.settings = settings
         self._schedule_cb = schedule_cb
+        self._planned: set[tuple[str, str, str]] = set()
         self.job = job
         self._gemini_connect = gemini_connect
         self._hangup = hangup_cb
@@ -502,8 +503,21 @@ class GeminiVoiceSession:
 
     async def _handle_callback_call(self, fc: dict[str, Any]) -> None:
         args = fc.get("args") or fc.get("arguments") or {}
+        key = (
+            str(args.get("uhrzeit") or "").strip(),
+            str(args.get("in_minuten") or "").strip(),
+            " ".join(str(args.get("aufgabe") or "").lower().split()),
+        )
+        if key in self._planned:
+            # Gemini sometimes repeats the same call; never book twice.
+            await self._send_function_response(
+                fc.get("id"), "aufgabe_planen", {"result": "Schon eingeplant, nicht erneut bestätigen."}
+            )
+            return
         try:
             response = self._schedule_cb(args)
+            if "error" not in response:
+                self._planned.add(key)
         except StellaError as exc:
             response = {"error": exc.message}
         except Exception:

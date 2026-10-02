@@ -1488,3 +1488,31 @@ async def test_background_callback_retries_once_then_gives_up_without_internal_b
     assert await callback_bg.run(settings, plan) is False
     assert len(calls) == 2
     assert not hasattr(store, "list_scheduled")  # no internal scheduler anymore
+
+
+@pytest.mark.asyncio
+async def test_aufgabe_planen_dedupes_repeated_calls(tmp_path):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+    booked: list[dict] = []
+
+    def schedule_cb(args):
+        booked.append(args)
+        return {"result": "Eingeplant."}
+
+    ws = FakeProviderWS()
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None, hangup_cb=lambda: None,
+        transcript_cb=lambda c: None, outcome_cb=lambda t: None, schedule_cb=schedule_cb,
+    )
+    sess._gemini_ws = ws
+    call = {"name": "aufgabe_planen", "args": {"in_minuten": 5, "aufgabe": "Erinner mich an Tabletten"}}
+    for i in range(3):
+        await sess._handle_gemini_event({"toolCall": {"functionCalls": [dict(call, id=f"t{i}")]}})
+    assert len(booked) == 1
+    assert len(ws.sent) == 3 and "Schon eingeplant" in str(ws.sent[-1])
+    other = {"name": "aufgabe_planen", "id": "x", "args": {"in_minuten": 5, "aufgabe": "Wasser trinken"}}
+    await sess._handle_gemini_event({"toolCall": {"functionCalls": [other]}})
+    assert len(booked) == 2
+    assert "Per\nAnruf, per Telegram oder beides" in sess._setup_payload()["systemInstruction"]["parts"][0]["text"]

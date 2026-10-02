@@ -7,7 +7,9 @@ little-endian (typically 16 kHz in, 24 kHz out).
 Downsampling 24 kHz -> 8 kHz with audioop.ratecv (linear interpolation)
 aliases badly and often emits a length that is not 20 ms-aligned. Sending
 that blob as one Telnyx media event mis-frames RTP and sounds swapped,
-choppy, or distorted. Integer-ratio averaging + 20 ms framing fixes that.
+choppy, or distorted. Integer-ratio decimation with a proper windowed-sinc
+low-pass (telephone band, ~3.6 kHz) + 20 ms framing fixes that and keeps
+sibilants from folding back as harshness.
 """
 
 from __future__ import annotations
@@ -16,6 +18,9 @@ import audioop
 import base64
 import re
 import struct
+from functools import lru_cache
+
+import numpy as np
 
 TELNYX_RATE = 8000
 TELNYX_FRAME_SAMPLES = 160  # 20 ms
@@ -91,6 +96,54 @@ def upsample_linear(samples: list[int], factor: int) -> list[int]:
     return out
 
 
+@lru_cache(maxsize=8)
+def _lowpass_taps(rate: int, cutoff_hz: float, taps: int) -> np.ndarray:
+    """Kaiser-windowed sinc low-pass, unity DC gain."""
+    n = np.arange(taps) - (taps - 1) / 2
+    fc = cutoff_hz / rate
+    h = 2 * fc * np.sinc(2 * fc * n) * np.kaiser(taps, 8.0)
+    return (h / h.sum()).astype(np.float64)
+
+
+class FirDecimator:
+    """Streaming anti-aliased integer decimation (e.g. 24 kHz -> 8 kHz), chunk-safe."""
+
+    def __init__(self, rate: int, factor: int, cutoff_hz: float = 3600.0, taps: int = 63) -> None:
+        self._factor = factor
+        self._h = _lowpass_taps(rate, cutoff_hz, taps)
+        # Zero-primed history so the output length equals len(input) // factor.
+        self._tail = np.zeros(taps - 1)
+        self._phase = 0
+
+    def process(self, samples: list[int]) -> list[int]:
+        if not samples:
+            return []
+        buf = np.concatenate([self._tail, np.asarray(samples, dtype=np.float64)])
+        filtered = np.convolve(buf, self._h, mode="valid")  # len == len(samples)
+        self._tail = buf[-(len(self._h) - 1):]
+        out = filtered[self._phase :: self._factor]
+        self._phase = (self._phase - len(filtered)) % self._factor
+        return np.clip(np.rint(out), _INT16_MIN, _INT16_MAX).astype(int).tolist()
+
+
+class FirUpsampler2:
+    """Streaming 2x interpolation (8 -> 16 kHz) with an image-rejection low-pass."""
+
+    def __init__(self, rate_out: int = GEMINI_IN_RATE, cutoff_hz: float = 3700.0, taps: int = 31) -> None:
+        self._h = _lowpass_taps(rate_out, cutoff_hz, taps) * 2  # compensate zero stuffing
+        self._tail = np.zeros(taps - 1)
+
+    def process(self, samples: list[int]) -> list[int]:
+        if not samples:
+            return []
+        stuffed = np.zeros(len(samples) * 2)
+        stuffed[::2] = samples
+        buf = np.concatenate([self._tail, stuffed])
+        out = np.convolve(buf, self._h, mode="valid")
+        self._tail = buf[-(len(self._h) - 1):]
+        return np.clip(np.rint(out), _INT16_MIN, _INT16_MAX).astype(int).tolist()
+
+
 def _split_pcmu_frames(ulaw: bytes) -> tuple[list[bytes], bytes]:
     frames: list[bytes] = []
     offset = 0
@@ -106,6 +159,7 @@ class Pcmu8kToPcm16k:
 
     def __init__(self) -> None:
         self._odd = b""
+        self._up = FirUpsampler2()
 
     def convert_b64(self, pcmu_b64: str) -> bytes:
         try:
@@ -117,7 +171,7 @@ class Pcmu8kToPcm16k:
         # ulaw2lin emits native-endian 16-bit; pack back as LE for Gemini.
         native = audioop.ulaw2lin(ulaw, SAMPLE_WIDTH)
         samples = list(struct.unpack_from("h" * (len(native) // SAMPLE_WIDTH), native, 0))
-        pcm16 = upsample_linear(samples, GEMINI_IN_RATE // TELNYX_RATE)
+        pcm16 = self._up.process(samples)
         return pack_pcm16le(pcm16)
 
 
@@ -131,6 +185,7 @@ class PcmToPcmu8k:
         self._byte_leftover = b""
         self._sample_leftover: list[int] = []
         self._ulaw_leftover = b""
+        self._decimator: FirDecimator | None = None
 
     def convert_frames_b64(self, pcm_b64: str, mime: str | None = None) -> list[str]:
         rate = parse_pcm_rate(mime, self._default_rate)
@@ -138,6 +193,7 @@ class PcmToPcmu8k:
             self._rate = rate
             self._ratecv_state = None
             self._sample_leftover = []
+            self._decimator = None
         try:
             raw = base64.b64decode(pcm_b64)
         except Exception:
@@ -154,7 +210,11 @@ class PcmToPcmu8k:
         if rate == TELNYX_RATE:
             pcm8 = samples
         elif rate > TELNYX_RATE and rate % TELNYX_RATE == 0:
-            pcm8, self._sample_leftover = downsample_integer(samples, rate // TELNYX_RATE)
+            if self._decimator is None:
+                self._decimator = FirDecimator(rate, rate // TELNYX_RATE)
+            keep = (len(samples) // (rate // TELNYX_RATE)) * (rate // TELNYX_RATE)
+            pcm8 = self._decimator.process(samples[:keep])
+            self._sample_leftover = samples[keep:]
         else:
             packed = pack_pcm16le(samples)
             converted, self._ratecv_state = audioop.ratecv(

@@ -1294,3 +1294,33 @@ async def test_hangup_waits_only_for_queued_audio_not_whole_call():
     assert slept and slept[-1] <= 0.2 + 0.35 + 0.01
     guard.clear_playout()
     assert guard.remaining_playout_s() == 0.0
+
+
+def test_fir_decimator_flat_in_band_and_rejects_aliases():
+    import numpy as np
+
+    from stella.audio_pcmu import FirDecimator, FirUpsampler2
+
+    def tone(f, rate, sec=1.0):
+        t = np.arange(int(rate * sec)) / rate
+        return (10000 * np.sin(2 * np.pi * f * t)).astype(int).tolist()
+
+    def rms(x):
+        return float(np.sqrt((np.array(x[200:], dtype=float) ** 2).mean()))
+
+    ref = rms(tone(1000, 24000))
+    assert rms(FirDecimator(24000, 3).process(tone(1000, 24000))) > 0.97 * ref
+    assert rms(FirDecimator(24000, 3).process(tone(2500, 24000))) > 0.9 * ref
+    for f in (5000, 6000, 9000):  # would alias into the band with a box filter
+        assert rms(FirDecimator(24000, 3).process(tone(f, 24000))) < 0.02 * ref
+
+    x = tone(1000, 24000, 0.5)
+    whole = FirDecimator(24000, 3).process(x)
+    d = FirDecimator(24000, 3)
+    chunked = []
+    for i in range(0, len(x), 480):
+        chunked += d.process(x[i : i + 480])
+    assert whole == chunked and len(whole) == len(x) // 3
+
+    up = FirUpsampler2().process(tone(1000, 8000))
+    assert len(up) == 16000 and abs(rms(up) - rms(tone(1000, 8000))) < 0.03 * ref

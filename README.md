@@ -1,6 +1,6 @@
 # Stella
 
-Independent **voice / phone** stack. Ida dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Gemini Live** (`GEMINI_API_KEY`). Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. There is no mid-call roundtrip to Ida.
+Independent **voice / phone** stack. Ida dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Gemini Live** (`GEMINI_API_KEY`). Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. The one exception is the optional [`frag_ida`](#frag-ida-claude-code-im-anruf) lookup, available only on calls to the owner’s own number.
 
 ```
 Ida / Cursor  --MCP-->  Stella HTTP
@@ -62,6 +62,31 @@ Optional overrides: **`GEMINI_LIVE_MODEL`** (default **`gemini-3.8-live`**, conf
 The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5 native-audio preview. If that model’s Live **setup** handshake fails, Stella retries (same WebSocket path only): `gemini-3.1-flash-live-preview` → `gemini-2.5-flash-native-audio-preview-12-2025` → `gemini-2.5-flash-native-audio-latest`. It never uses `gemini-2.5-flash-native-audio-preview-09-2025` or `gemini-3.8-live-extended-thinking`. Do not use translate/transcribe Live ids for PSTN dialogue.
 
 **Hang-up:** The model must call `hang_up` to drop the PSTN leg (spoken “tschüss” is not enough). TelnyxMediaGuard still waits for stream start and outbound playout. A backup fires if the spoken transcript looks like a farewell and inbound stays quiet for `STELLA_FAREWELL_HANGUP_S` (disable with `STELLA_FAREWELL_HANGUP=false`).
+
+## Frag Ida (Claude Code im Anruf)
+
+On a call to the **owner number**, Gemini can look up Simon’s personal data (calendar, timetable, homework, mail read-only, smart-home status) via the function tool `frag_ida`:
+
+1. Simon asks; Gemini says “Moment, ich schau nach” and calls `frag_ida(frage, bestaetigt?)`.
+2. Stella runs Claude Code headless (`claude -p`, model `ASK_IDA_MODEL`, default `haiku`) in the container with only the MCP servers from `ASK_IDA_MCP_CONFIG` (`--strict-mcp-config`). Built-in tools (shell, files, web) are off; the question goes in via stdin, never through a shell.
+3. Claude answers in 1–3 spoken German sentences; the text (max 600 chars) goes back to Gemini as the tool result and Gemini says it.
+
+The call is handled in a background task, so audio, VAD, hang-up and farewell guards keep running. `gemini-3.8-live` is not documented to support non-blocking function calls (only 2.5 Flash Live is), so Stella uses the default blocking behaviour and relies on Gemini announcing the lookup before the call.
+
+**Security model**
+
+- `frag_ida` is offered only if `ASK_IDA_ENABLED=true` **and** the dialed number equals `STELLA_OWNER_NUMBER` (checked at dial time, stored as `allow_ida` on the job, and re-checked when the media session starts). `stella_call`/`stella_briefing_call` accept `allow_ida=false` to switch it off; `true` never overrides the number check. Calls to anyone else get no such tool and Stella says she doesn’t know.
+- Only tools in `ASK_IDA_ALLOWED_TOOLS` (exact `mcp__<server>__<tool>` names, **read-only**) are usable; anything else is denied by Claude Code (`--permission-mode dontAsk`). `ASK_IDA_DENY_TOOLS` always wins (default: SSH, Cloudflare, delete/clear tools).
+- Optional `ASK_IDA_WRITE_TOOLS` (empty by default) are only unlocked when Gemini passes `bestaetigt=true`, which it must do only after Simon explicitly says yes to a spoken “Soll ich das wirklich machen?”. This confirmation is model-enforced, not cryptographic; keep the list empty unless you accept that.
+- Prompt injection (e.g. a malicious mail) is mitigated by the read-only allowlist and the system prompt, not eliminated.
+
+**Setup**
+
+1. `cp ida-mcp.example.json data/ida-mcp.json` and fill in your Ida MCP servers (URLs, `${IDA_MCP_TOKEN}`). Never commit it.
+2. In `.env`: `ASK_IDA_ENABLED=true`, `STELLA_OWNER_NUMBER=+49…`, `ASK_IDA_ALLOWED_TOOLS=mcp__Ida_Untis__stundenplan,…`, and Claude Code auth: `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), plus `IDA_MCP_TOKEN`.
+3. `docker compose up -d --build` (the image installs Node + Claude Code, version pinned in the `Dockerfile`; `HOME`/`CLAUDE_CONFIG_DIR` live under `/data`).
+
+**Latency:** a lookup takes several seconds (Claude start + MCP + model; ~4–6 s measured locally with haiku and one tool). With `STELLA_LATENCY_LOG=true`, Stella logs `stella_latency ask_ida_ms ms=<n>`. Timeout: `ASK_IDA_TIMEOUT_S` (default 25 s).
 
 ## Telnyx
 

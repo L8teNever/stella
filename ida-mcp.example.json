@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "Ida_Untis": {
+      "type": "http",
+      "url": "https://<ida-mcp-host>/untis/mcp",
+      "headers": { "Authorization": "Bearer ${IDA_MCP_TOKEN}" }
+    },
+    "Ida_Google": {
+      "type": "http",
+      "url": "https://<ida-mcp-host>/google/mcp",
+      "headers": { "Authorization": "Bearer ${IDA_MCP_TOKEN}" }
+    },
+    "Ida_Homeassistant": {
+      "type": "http",
+      "url": "https://<ida-mcp-host>/homeassistant/mcp",
+      "headers": { "Authorization": "Bearer ${IDA_MCP_TOKEN}" }
+    }
+  }
+}

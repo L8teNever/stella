@@ -1002,3 +1002,268 @@ def test_mcp_token_protects_mcp_and_calls(tmp_path):
     assert client.get("/calls/x?Token=wrong").status_code == 401
     assert client.get("/calls/x?Token=s3cret").status_code == 404
     assert client.get("/calls/x", headers={"Authorization": "Bearer s3cret"}).status_code == 404
+
+
+# --- frag_ida (Claude Code as thinker) ---------------------------------------
+
+from stella import ask_ida as ask_ida_mod  # noqa: E402
+from stella.gemini_voice import gemini_tools  # noqa: E402
+
+OWNER = "+4917612345678"
+
+
+class FakeProc:
+    def __init__(self, stdout=b"Morgen um acht Uhr Mathe.", stderr=b"", rc=0, hang=False):
+        self._out, self._err, self.returncode, self._hang = stdout, stderr, rc, hang
+        self.killed = False
+        self.stdin_data: bytes | None = None
+        self._done = asyncio.Event()
+
+    async def communicate(self, data=None):
+        self.stdin_data = data
+        if self._hang:
+            await self._done.wait()
+        return self._out, self._err
+
+    def kill(self):
+        self.killed = True
+        self._done.set()
+
+    async def wait(self):
+        return self.returncode
+
+
+def ida_settings(tmp_path, **kw):
+    opts = dict(
+        ask_ida_enabled=True,
+        stella_owner_number=OWNER,
+        ask_ida_allowed_tools="mcp__Ida_Untis__stundenplan,mcp__Ida_SSH__ssh_befehl_ausfuehren",
+        ask_ida_write_tools="mcp__Ida_Dashboard__create_event",
+        ask_ida_mcp_config=str(tmp_path / "ida-mcp.json"),
+    )
+    opts.update(kw)
+    return make_settings(tmp_path, **opts)
+
+
+def make_spawner(proc):
+    calls: list[tuple] = []
+
+    async def spawn(*argv, **kwargs):
+        calls.append((argv, kwargs))
+        return proc
+
+    return spawn, calls
+
+
+@pytest.mark.asyncio
+async def test_ask_ida_success_args_and_no_shell(tmp_path):
+    settings = ida_settings(tmp_path)
+    proc = FakeProc()
+    spawn, calls = make_spawner(proc)
+    q = 'Was habe ich morgen? "; rm -rf / #'
+    out = await ask_ida_mod.ask_ida(settings, q, spawn=spawn)
+    assert out == "Morgen um acht Uhr Mathe."
+    argv, kwargs = calls[0]
+    assert argv[0] == "claude" and "-p" in argv
+    assert "--strict-mcp-config" in argv
+    assert argv[argv.index("--mcp-config") + 1] == settings.ask_ida_mcp_config
+    assert argv[argv.index("--tools") + 1] == ""
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "mcp__Ida_Untis__stundenplan"  # SSH denied, write tool not confirmed
+    assert "Bash" in argv[argv.index("--disallowedTools") + 1]
+    assert "mcp__Ida_SSH" in argv[argv.index("--disallowedTools") + 1]
+    assert q not in argv and not any(q in a for a in argv)  # stdin only
+    assert proc.stdin_data == q.encode()
+    assert "shell" not in kwargs
+    assert "GEMINI_API_KEY" not in kwargs["env"]
+
+
+def test_ask_ida_write_tools_only_when_confirmed(tmp_path):
+    settings = ida_settings(tmp_path)
+    assert "mcp__Ida_Dashboard__create_event" not in ask_ida_mod.resolve_tools(settings, False)[0]
+    assert "mcp__Ida_Dashboard__create_event" in ask_ida_mod.resolve_tools(settings, True)[0]
+    # deny always wins, even when confirmed
+    settings = ida_settings(tmp_path, ask_ida_write_tools="mcp__X__termin_loeschen")
+    assert "mcp__X__termin_loeschen" not in ask_ida_mod.resolve_tools(settings, True)[0]
+    cmd = ask_ida_mod.build_command(settings, False)
+    assert ask_ida_mod.NEEDS_CONFIRMATION in cmd[cmd.index("--append-system-prompt") + 1]
+
+
+@pytest.mark.asyncio
+async def test_ask_ida_timeout_kills_process(tmp_path):
+    settings = ida_settings(tmp_path, ask_ida_timeout_s=0.05)
+    proc = FakeProc(hang=True)
+    spawn, _ = make_spawner(proc)
+    out = await ask_ida_mod.ask_ida(settings, "Termine?", spawn=spawn)
+    assert out == ask_ida_mod.MSG_TIMEOUT
+    assert proc.killed
+
+
+@pytest.mark.asyncio
+async def test_ask_ida_errors_empty_and_clip(tmp_path):
+    settings = ida_settings(tmp_path)
+    spawn, _ = make_spawner(FakeProc(stderr=b"boom sk-secret", rc=1))
+    assert await ask_ida_mod.ask_ida(settings, "x", spawn=spawn) == ask_ida_mod.MSG_FAILED
+    spawn, _ = make_spawner(FakeProc(stdout=b"  \n"))
+    assert await ask_ida_mod.ask_ida(settings, "x", spawn=spawn) == ask_ida_mod.MSG_EMPTY
+    spawn, _ = make_spawner(FakeProc(stdout=b"wort " * 400))
+    out = await ask_ida_mod.ask_ida(settings, "x", spawn=spawn)
+    assert len(out) <= ask_ida_mod.MAX_ANSWER_CHARS
+
+
+@pytest.mark.asyncio
+async def test_ask_ida_cancel_event_kills_process(tmp_path):
+    settings = ida_settings(tmp_path)
+    proc = FakeProc(hang=True)
+    spawn, _ = make_spawner(proc)
+    cancel = asyncio.Event()
+    task = asyncio.create_task(
+        ask_ida_mod.ask_ida(settings, "x", spawn=spawn, cancel_event=cancel)
+    )
+    await asyncio.sleep(0.05)
+    cancel.set()
+    await task
+    assert proc.killed
+
+
+def test_ida_allowed_only_for_owner(tmp_path):
+    s = ida_settings(tmp_path)
+    assert ask_ida_mod.ida_allowed_for(s, OWNER)
+    assert not ask_ida_mod.ida_allowed_for(s, "+4915112345678")
+    assert not ask_ida_mod.ida_allowed_for(s, OWNER, False)
+    assert not ask_ida_mod.ida_allowed_for(ida_settings(tmp_path, ask_ida_enabled=False), OWNER)
+    assert not ask_ida_mod.ida_allowed_for(ida_settings(tmp_path, stella_owner_number=""), OWNER)
+
+
+def test_place_call_sets_allow_ida_only_for_owner(tmp_path):
+    settings = ida_settings(tmp_path)
+    svc = JobService(settings, JobStore(settings.stella_db_path), TelnyxClient(settings, FakeTransport()))
+    assert svc.place_call(to=OWNER, brief="hi").allow_ida is True
+    assert svc.place_call(to="+14155552671", brief="hi", allow_ida=True).allow_ida is False
+
+
+def test_gemini_setup_includes_frag_ida_only_when_allowed(tmp_path):
+    names = lambda ask: [  # noqa: E731
+        d["name"] for t in gemini_tools(ask_ida=ask) for d in t["functionDeclarations"]
+    ]
+    assert names(False) == ["hang_up"]
+    assert names(True) == ["hang_up", "frag_ida"]
+
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+
+    def setup_tools(to, allow):
+        job = store.create(kind="call", to_number=to, brief="b", allow_ida=allow)
+        sess = GeminiVoiceSession(
+            settings=settings, job=job, gemini_connect=None,
+            hangup_cb=lambda: None, transcript_cb=lambda c: None, outcome_cb=lambda t: None,
+        )
+        payload = sess._setup_payload()
+        return (
+            [d["name"] for t in payload["tools"] for d in t["functionDeclarations"]],
+            payload["systemInstruction"]["parts"][0]["text"],
+        )
+
+    tools, text = setup_tools(OWNER, True)
+    assert "frag_ida" in tools and "frag_ida" in text
+    tools, text = setup_tools("+14155552671", True)  # flag set but not the owner number
+    assert tools == ["hang_up"] and "frag_ida" not in text
+    tools, _ = setup_tools(OWNER, False)
+    assert tools == ["hang_up"]
+
+
+@pytest.mark.asyncio
+async def test_frag_ida_does_not_block_and_hang_up_still_works(tmp_path, monkeypatch):
+    settings = ida_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number=OWNER, brief="b", allow_ida=True)
+    release = asyncio.Event()
+    seen: dict[str, Any] = {}
+
+    async def fake_ask(settings, question, **kw):
+        seen["q"], seen["confirmed"] = question, kw.get("confirmed")
+        await release.wait()
+        return "Du hast morgen Mathe."
+
+    monkeypatch.setattr("stella.gemini_voice.ask_ida", fake_ask)
+    ws = FakeProviderWS()
+    outcomes: list[str] = []
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None,
+        hangup_cb=lambda: None, transcript_cb=lambda c: None, outcome_cb=outcomes.append,
+    )
+    sess._gemini_ws = ws
+    sess._telnyx_ws = FakeTelnyxWS()
+    await asyncio.wait_for(
+        sess._handle_gemini_event(
+            {"toolCall": {"functionCalls": [
+                {"id": "c1", "name": "frag_ida", "args": {"frage": "Stundenplan morgen?"}}
+            ]}}
+        ),
+        timeout=1,
+    )  # returns immediately although ask_ida is still pending
+    assert not ws.sent
+    # while frag_ida is pending, hang_up is handled as before
+    await sess._handle_gemini_event(
+        {"toolCall": {"functionCalls": [
+            {"id": "h1", "name": "hang_up", "args": {"outcome": "done"}}
+        ]}}
+    )
+    assert outcomes == ["done"]
+    assert ws.sent[-1]["toolResponse"]["functionResponses"][0]["id"] == "h1"
+    # a second frag_ida while one is running is rejected immediately
+    await sess._handle_gemini_event(
+        {"toolCall": {"functionCalls": [{"id": "c2", "name": "frag_ida", "args": {"frage": "x"}}]}}
+    )
+    await asyncio.sleep(0.05)
+    busy = [m for m in ws.sent if m["toolResponse"]["functionResponses"][0]["id"] == "c2"]
+    assert busy and "error" in busy[0]["toolResponse"]["functionResponses"][0]["response"]
+    release.set()
+    await sess._ida_task
+    last = ws.sent[-1]["toolResponse"]["functionResponses"][0]
+    assert last == {"id": "c1", "name": "frag_ida", "response": {"result": "Du hast morgen Mathe."}}
+    assert seen == {"q": "Stundenplan morgen?", "confirmed": False}
+    sess.guard.hangup_wait_audio_s = 0
+    await sess.close()
+
+
+@pytest.mark.asyncio
+async def test_frag_ida_ignored_when_not_allowed(tmp_path):
+    settings = make_settings(tmp_path)  # ask_ida disabled
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="b", allow_ida=True)
+    ws = FakeProviderWS()
+    sess = GeminiVoiceSession(
+        settings=settings, job=job, gemini_connect=None,
+        hangup_cb=lambda: None, transcript_cb=lambda c: None, outcome_cb=lambda t: None,
+    )
+    sess._gemini_ws = ws
+    await sess._handle_gemini_event(
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "frag_ida", "args": {"frage": "x"}}]}}
+    )
+    assert sess._ida_task is None and not ws.sent
+
+
+def test_old_db_without_allow_ida_column_loads(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, to_number TEXT NOT NULL,
+        brief TEXT NOT NULL, context TEXT NOT NULL DEFAULT '', speak_to TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL, telnyx_call_control_id TEXT NOT NULL DEFAULT '',
+        telnyx_call_leg_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '',
+        transcript TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+        voice_provider TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+    )
+    conn.execute(
+        "INSERT INTO jobs (id, kind, to_number, brief, status, voice_provider, created_at, updated_at)"
+        " VALUES ('old1','call','+491','b','completed','grok','t','t')"
+    )
+    conn.commit()
+    conn.close()
+    store = JobStore(str(db))
+    old = store.get("old1")
+    assert old.voice_provider == "grok" and old.allow_ida is False
+    assert store.create(kind="call", to_number="+492", brief="b", allow_ida=True).allow_ida is True

@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from stella.config import Settings
+from stella.ask_ida import ida_allowed_for
 from stella.errors import StellaError, normalize_e164
 from stella.store import CallJob, JobStore
 from stella.telnyx_client import TelnyxClient
@@ -33,6 +34,7 @@ class JobService:
         context: str = "",
         speak_to: str = "",
         kind: str = "call",
+        allow_ida: bool | None = None,
     ) -> CallJob:
         to_e164 = normalize_e164(to)
         if not (brief or "").strip():
@@ -49,6 +51,7 @@ class JobService:
             brief=brief.strip(),
             context=(context or "").strip(),
             speak_to=(speak_to or "").strip(),
+            allow_ida=ida_allowed_for(self.settings, to_e164, allow_ida),
         )
         self.store.update(job.id, voice_provider=provider)
         webhook = self.settings.public_http_url("/webhooks/telnyx")

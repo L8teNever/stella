@@ -29,6 +29,7 @@ class CallJob:
     transcript: str
     error: str
     voice_provider: str
+    allow_ida: bool
     created_at: str
     updated_at: str
 
@@ -46,6 +47,7 @@ class CallJob:
             "transcript": self.transcript or None,
             "error": self.error or None,
             "voice_provider": self.voice_provider or None,
+            "allow_ida": self.allow_ida,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -81,6 +83,7 @@ class JobStore:
                     transcript TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     voice_provider TEXT NOT NULL DEFAULT '',
+                    allow_ida INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -90,6 +93,10 @@ class JobStore:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN voice_provider TEXT NOT NULL DEFAULT ''"
                 )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN allow_ida INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
             conn.execute(
@@ -113,6 +120,7 @@ class JobStore:
         brief: str,
         context: str = "",
         speak_to: str = "",
+        allow_ida: bool = False,
     ) -> CallJob:
         job = CallJob(
             id=str(uuid.uuid4()),
@@ -128,6 +136,7 @@ class JobStore:
             transcript="",
             error="",
             voice_provider="",
+            allow_ida=bool(allow_ida),
             created_at=_now(),
             updated_at=_now(),
         )
@@ -137,8 +146,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, kind, to_number, brief, context, speak_to, status,
                     telnyx_call_control_id, telnyx_call_leg_id, outcome,
-                    transcript, error, voice_provider, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript, error, voice_provider, allow_ida, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -154,6 +163,7 @@ class JobStore:
                     job.transcript,
                     job.error,
                     job.voice_provider,
+                    int(job.allow_ida),
                     job.created_at,
                     job.updated_at,
                 ),
@@ -234,6 +244,7 @@ class JobStore:
             transcript=row["transcript"],
             error=row["error"],
             voice_provider=row["voice_provider"] if "voice_provider" in row.keys() else "",
+            allow_ida=bool(row["allow_ida"]) if "allow_ida" in row.keys() else False,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

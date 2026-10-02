@@ -13,7 +13,8 @@ def build_mcp(service: JobService) -> FastMCP:
         "stella",
         instructions=(
             "Stella places outbound phone calls. Pass everything the agent needs "
-            "in brief/context — Stella has no access to Ida memory or other MCPs."
+            "in brief/context. Stella has no direct access to Ida memory or other MCPs; only calls"
+            " to the owner number may use the live `frag_ida` lookup."
         ),
         stateless_http=True,
     )
@@ -26,11 +27,21 @@ def build_mcp(service: JobService) -> FastMCP:
         brief: str,
         context: str = "",
         speak_to: str = "",
+        allow_ida: bool | None = None,
     ) -> dict[str, Any]:
-        """Place an outbound call. `to` must be E.164. Stella only knows `brief` + `context`."""
+        """Place an outbound call. `to` must be E.164. Stella only knows `brief` + `context`.
+
+        `allow_ida`: offer the live `frag_ida` lookup tool. Only ever honoured when `to`
+        is the configured owner number; leave unset for the default (on for the owner).
+        """
         try:
             job = service.place_call(
-                to=to, brief=brief, context=context, speak_to=speak_to, kind="call"
+                to=to,
+                brief=brief,
+                context=context,
+                speak_to=speak_to,
+                kind="call",
+                allow_ida=allow_ida,
             )
             return job.to_public_dict()
         except StellaError as exc:
@@ -48,7 +59,9 @@ def build_mcp(service: JobService) -> FastMCP:
             return exc.to_dict()
 
     @mcp.tool()
-    def stella_briefing_call(to: str, text: str, speak_to: str = "") -> dict[str, Any]:
+    def stella_briefing_call(
+        to: str, text: str, speak_to: str = "", allow_ida: bool | None = None
+    ) -> dict[str, Any]:
         """Call a number and read `text` aloud (e.g. a morning briefing), then hang up."""
         try:
             brief = (
@@ -62,6 +75,7 @@ def build_mcp(service: JobService) -> FastMCP:
                 context=text,
                 speak_to=speak_to,
                 kind="briefing",
+                allow_ida=allow_ida,
             )
             return job.to_public_dict()
         except StellaError as exc:

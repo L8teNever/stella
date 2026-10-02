@@ -145,7 +145,20 @@ def job_wants_german(job: CallJob) -> bool:
 KICKOFF_TEXT = "They answered. Start from the brief now."
 
 
-def build_instructions(job: CallJob) -> str:
+ASK_IDA_INSTRUCTIONS = """
+Lookup tool frag_ida: You are talking to Simon himself. If he asks about his calendar
+appointments, school timetable or cancellations, homework, e-mails (read only) or smart
+home status, first say a short "Moment, ich schau nach" and then call frag_ida with his
+question in the `frage` parameter. Afterwards say the result in your own short words.
+Never invent data. If frag_ida reports an error or finds nothing, say so honestly.
+If the result contains AKTION_BRAUCHT_BESTAETIGUNG, tell Simon what would be done and ask
+"Soll ich das wirklich machen?". Only if he clearly says yes, call frag_ida again with the
+same question and bestaetigt=true. Never set bestaetigt=true without his explicit yes.
+Not for general knowledge: answer those yourself or say you don't know.
+"""
+
+
+def build_instructions(job: CallJob, *, ask_ida: bool = False) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
     lang = ""
     if job_wants_german(job):
@@ -156,6 +169,7 @@ def build_instructions(job: CallJob) -> str:
             "Never loop 'ich verstehe nicht' or ask to repeat unless they said nothing.\n"
         )
     ctx = job.context.strip() or "(none provided)"
+    ida = ASK_IDA_INSTRUCTIONS if ask_ida else ""
     return (
         f"{STELLA_SYSTEM}\n\n"
         f"{speak}"
@@ -163,6 +177,7 @@ def build_instructions(job: CallJob) -> str:
         f"Job type: {job.kind}\n"
         f"Brief / task:\n{job.brief.strip()}\n\n"
         f"Extra context from the dispatcher (this is all you have):\n{ctx}\n"
+        f"{ida}"
     )
 
 

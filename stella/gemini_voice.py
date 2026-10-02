@@ -8,6 +8,7 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
+from stella.ask_ida import MSG_BUSY, ask_ida, ida_allowed_for
 from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
 from stella.config import Settings
 from stella.energy_vad import EnergyVad, EnergyVadConfig, pcm_rms
@@ -155,6 +156,41 @@ def hang_up_tool_gemini() -> dict[str, Any]:
     }
 
 
+def ask_ida_tool_gemini() -> dict[str, Any]:
+    return {
+        "name": "frag_ida",
+        "description": (
+            "Fragt Simons persönliche Daten ab: Kalendertermine, Stundenplan und Ausfälle, "
+            "Hausaufgaben, Mails (nur lesen), Smart-Home-Status. Nicht für Allgemeinwissen. "
+            "Dauert einige Sekunden. Vorher kurz sagen, dass du nachschaust."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "frage": {
+                    "type": "STRING",
+                    "description": "Die Frage von Simon, vollständig und eigenständig formuliert.",
+                },
+                "bestaetigt": {
+                    "type": "BOOLEAN",
+                    "description": (
+                        "Nur true, wenn Simon eine zuvor vorgeschlagene Aktion ausdrücklich "
+                        "mit Ja bestätigt hat. Sonst weglassen."
+                    ),
+                },
+            },
+            "required": ["frage"],
+        },
+    }
+
+
+def gemini_tools(*, ask_ida: bool) -> list[dict[str, Any]]:
+    tools = hang_up_tool_gemini()
+    if ask_ida:
+        tools["functionDeclarations"].append(ask_ida_tool_gemini())
+    return [tools]
+
+
 class GeminiVoiceSession:
     """Bridge Telnyx media WebSocket <-> Gemini Live (BidiGenerateContent)."""
 
@@ -201,6 +237,10 @@ class GeminiVoiceSession:
         self._logged_setup_audio = False
         self._logged_turn_audio = False
         self._active_model = gemini_model_id(settings)
+        # frag_ida only on calls to the owner number (re-checked here, not just at dial).
+        self._ask_ida = bool(job.allow_ida) and ida_allowed_for(settings, job.to_number)
+        self._ida_task: asyncio.Task | None = None
+        self._ida_cancel = asyncio.Event()
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -296,9 +336,9 @@ class GeminiVoiceSession:
             "model": gemini_model_name(self.settings, model),
             "generationConfig": gemini_generation_config(self.settings, model),
             "systemInstruction": {
-                "parts": [{"text": build_instructions(self.job)}]
+                "parts": [{"text": build_instructions(self.job, ask_ida=self._ask_ida)}]
             },
-            "tools": [hang_up_tool_gemini()],
+            "tools": gemini_tools(ask_ida=self._ask_ida),
             "outputAudioTranscription": {},
             "inputAudioTranscription": {},
             "realtimeInputConfig": gemini_realtime_input_config(self.settings),
@@ -394,28 +434,53 @@ class GeminiVoiceSession:
 
         tool_call = event.get("toolCall") or {}
         for fc in tool_call.get("functionCalls") or []:
-            if fc.get("name") != "hang_up":
+            name = fc.get("name")
+            if name == "frag_ida" and self._ask_ida:
+                self._start_ask_ida(fc)
+                continue
+            if name != "hang_up":
                 continue
             outcome = parse_hang_up_args(fc.get("args") or fc.get("arguments") or {})
             self._outcome(outcome)
-            if self._gemini_ws:
-                await self._gemini_ws.send(
-                    json.dumps(
-                        {
-                            "toolResponse": {
-                                "functionResponses": [
-                                    {
-                                        "id": fc.get("id"),
-                                        "name": "hang_up",
-                                        "response": {"result": "hanging up"},
-                                    }
-                                ]
-                            }
-                        }
-                    )
-                )
+            await self._send_function_response(fc.get("id"), "hang_up", {"result": "hanging up"})
             self.guard.arm_hangup(self._deferred_hangup)
             return
+
+    async def _send_function_response(self, call_id, name: str, response: dict[str, Any]) -> None:
+        if self._closed or self._gemini_ws is None:
+            return
+        await self._gemini_ws.send(
+            json.dumps(
+                {
+                    "toolResponse": {
+                        "functionResponses": [
+                            {"id": call_id, "name": name, "response": response}
+                        ]
+                    }
+                }
+            )
+        )
+
+    def _start_ask_ida(self, fc: dict[str, Any]) -> None:
+        """Run frag_ida in a task so audio, VAD and the hangup guard keep running."""
+        if self._ida_task is not None and not self._ida_task.done():
+            asyncio.create_task(
+                self._send_function_response(fc.get("id"), "frag_ida", {"error": MSG_BUSY})
+            )
+            return
+        self._ida_task = asyncio.create_task(self._run_ask_ida(fc))
+
+    async def _run_ask_ida(self, fc: dict[str, Any]) -> None:
+        args = fc.get("args") or fc.get("arguments") or {}
+        question = str(args.get("frage") or "").strip()
+        confirmed = args.get("bestaetigt") is True
+        answer = await ask_ida(
+            self.settings, question, confirmed=confirmed, cancel_event=self._ida_cancel
+        )
+        try:
+            await self._send_function_response(fc.get("id"), "frag_ida", {"result": answer})
+        except Exception:
+            logger.exception("could not send frag_ida result")
 
     async def _forward_inbound_pcm(self, pcm: bytes) -> None:
         assert self._gemini_ws is not None
@@ -491,6 +556,9 @@ class GeminiVoiceSession:
         if self._closed:
             return
         self._closed = True
+        self._ida_cancel.set()
+        if self._ida_task is not None and not self._ida_task.done():
+            self._ida_task.cancel()
         self._setup_complete.set()
         self.guard.mark_started()
         if self._gemini_ws is None:

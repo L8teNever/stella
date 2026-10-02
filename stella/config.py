@@ -55,6 +55,29 @@ class Settings(BaseSettings):
     stella_farewell_hangup: bool = True
     stella_farewell_hangup_s: float = 1.5
 
+    # "Frag Ida": Gemini asks Claude Code (claude -p + Ida MCP servers) mid-call.
+    ask_ida_enabled: bool = False
+    ask_ida_model: str = "haiku"
+    ask_ida_max_turns: int = 4
+    ask_ida_timeout_s: float = 25.0
+    ask_ida_mcp_config: str = "/data/ida-mcp.json"
+    # Comma-separated exact MCP tool names (mcp__<server>__<tool>); read-only.
+    ask_ida_allowed_tools: str = ""
+    # Same format; only usable after the caller explicitly confirmed (bestaetigt=true).
+    ask_ida_write_tools: str = ""
+    # Never allowed, even if listed above. fnmatch patterns; server-wide and exact
+    # entries are also passed to Claude Code as --disallowedTools.
+    ask_ida_deny_tools: str = (
+        "mcp__Ida_SSH,mcp__Ida_Cloudflare,mcp__*__*_loeschen,mcp__*__*delete*,"
+        "mcp__*__google_mail_papierkorb,mcp__*__google_sheet_bereich_leeren"
+    )
+    # frag_ida is offered only on calls to this E.164 number.
+    stella_owner_number: str = ""
+    # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.
+    anthropic_api_key: str = ""
+    claude_code_oauth_token: str = ""
+    ida_mcp_token: str = ""
+
     def data_dir(self) -> Path:
         p = Path(self.stella_db_path).parent
         p.mkdir(parents=True, exist_ok=True)

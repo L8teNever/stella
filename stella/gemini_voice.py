@@ -158,8 +158,10 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
     return {
         "name": "frag_ida",
         "description": (
-            "Zugriff auf Simons Dienste (Kalender, Stundenplan und Ausfälle, Hausaufgaben, "
-            "Mails, Aufgaben, Kontakte, Smart Home, Erinnerungen, Notizen/Memory, Dokumente). "
+            "Zugriff auf alles, was Simon gehört oder was über ihn und sein Umfeld bekannt ist: "
+            "Personen und Wissen (z. B. 'wer ist Ludwig?'), Kalender, Stundenplan und Ausfälle, "
+            "Hausaufgaben, Mails, Aufgaben, Kontakte, Smart Home, Erinnerungen, Notizen/Memory, "
+            "Dokumente. Die Quelle wählt das Tool selbst, du musst keine nennen. "
             "Lesen geht direkt; Aktionen (Termin eintragen, Mail senden, Licht schalten, "
             "Erinnerung setzen ...) erst nach seinem ausdrücklichen Ja. Nicht für "
             "Allgemeinwissen. Dauert einige Sekunden. Vorher kurz sagen, dass du nachschaust."

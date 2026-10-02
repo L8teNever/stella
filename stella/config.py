@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # "Frag Ida": Gemini asks Claude Code (claude -p + Ida MCP servers) mid-call.
     ask_ida_enabled: bool = False
     ask_ida_model: str = "sonnet"
-    ask_ida_max_turns: int = 4
+    ask_ida_max_turns: int = 6
     ask_ida_timeout_s: float = 25.0
     ask_ida_mcp_config: str = "/data/ida-mcp.json"
     # Comma-separated exact MCP tool names (mcp__<server>__<tool>); read-only.

@@ -168,8 +168,9 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
                 "frage": {
                     "type": "STRING",
                     "description": (
-                        "Simons Frage möglichst wörtlich, inklusive des genannten Zeitraums "
-                        "(z. B. 'morgen'). Nichts hinzufügen oder erweitern."
+                        "Simons Frage im Wortlaut, nichts kürzen, hinzufügen oder erweitern. "
+                        "Wörter wie 'noch', 'heute noch', 'letzte', 'neueste', 'ungelesen' "
+                        "und der Zeitraum (z. B. 'morgen') müssen erhalten bleiben."
                     ),
                 },
                 "bestaetigt": {

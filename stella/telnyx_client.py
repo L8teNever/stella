@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from stella.audio_pcmu import CODEC_PCMU, preferred_telnyx_codec
 from stella.config import Settings
 from stella.errors import StellaError
 
@@ -61,21 +62,17 @@ class TelnyxClient:
         webhook_url: str,
         stream_url: str,
         client_state: str | None = None,
+        stream_bidirectional_codec: str | None = None,
     ) -> dict[str, Any]:
         self._require_config()
+        codec = self._normalize_codec(stream_bidirectional_codec, to)
         payload: dict[str, Any] = {
             "to": to,
             "from": self.settings.telnyx_from_number,
             "connection_id": self.settings.telnyx_connection_id,
             "webhook_url": webhook_url,
             "webhook_url_method": "POST",
-            "stream_url": stream_url,
-            # inbound_track = callee audio only. both_tracks would echo our
-            # outbound RTP back into the model and cause feedback / "swapped" audio.
-            "stream_track": "inbound_track",
-            "stream_bidirectional_mode": "rtp",
-            "stream_bidirectional_codec": "PCMU",
-            "stream_bidirectional_sampling_rate": 8000,
+            **self._stream_fields(stream_url, codec),
             "answering_machine_detection": "detect",
         }
         if client_state:
@@ -90,6 +87,67 @@ class TelnyxClient:
                 "telnyx_api_error",
             )
         return inner
+
+    def _normalize_codec(self, codec: str | None, *numbers: str | None) -> str:
+        chosen = codec or preferred_telnyx_codec(self.settings.telnyx_from_number, *numbers)
+        return chosen if chosen in {"PCMU", "PCMA"} else CODEC_PCMU
+
+    def _stream_fields(self, stream_url: str, codec: str) -> dict[str, Any]:
+        # inbound_track = far-end audio only. both_tracks would echo our
+        # outbound RTP back into the model and cause feedback / "swapped" audio.
+        return {
+            "stream_url": stream_url,
+            "stream_track": "inbound_track",
+            "stream_bidirectional_mode": "rtp",
+            "stream_bidirectional_codec": codec,
+            "stream_bidirectional_sampling_rate": 8000,
+        }
+
+    def _action(self, call_control_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_config()
+        resp = self._http.request(
+            "POST",
+            self._url(f"/calls/{call_control_id}/actions/{action}"),
+            headers=self._headers(),
+            json=payload,
+        )
+        return self._parse(resp, action)
+
+    def answer(
+        self,
+        call_control_id: str,
+        *,
+        client_state: str | None = None,
+        webhook_url: str | None = None,
+        stream_url: str | None = None,
+        stream_bidirectional_codec: str | None = None,
+        party_number: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if client_state:
+            payload["client_state"] = client_state
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
+            payload["webhook_url_method"] = "POST"
+        if stream_url:
+            codec = self._normalize_codec(stream_bidirectional_codec, party_number)
+            payload.update(self._stream_fields(stream_url, codec))
+        return self._action(call_control_id, "answer", payload)
+
+    def streaming_start(
+        self,
+        call_control_id: str,
+        *,
+        stream_url: str,
+        stream_bidirectional_codec: str | None = None,
+        party_number: str | None = None,
+        client_state: str | None = None,
+    ) -> dict[str, Any]:
+        codec = self._normalize_codec(stream_bidirectional_codec, party_number)
+        payload: dict[str, Any] = self._stream_fields(stream_url, codec)
+        if client_state:
+            payload["client_state"] = client_state
+        return self._action(call_control_id, "streaming_start", payload)
 
     def hangup(self, call_control_id: str) -> dict[str, Any]:
         self._require_config()

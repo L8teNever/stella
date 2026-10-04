@@ -9,7 +9,14 @@ from typing import Any
 from urllib.parse import urlencode
 
 from stella.ask_ida import MSG_BUSY, ask_ida, ida_allowed_for
-from stella.audio_pcmu import GEMINI_OUT_RATE, PcmToPcmu8k, Pcmu8kToPcm16k
+from stella.audio_pcmu import (
+    GEMINI_OUT_RATE,
+    PcmToPcmu8k,
+    Pcmu8kToPcm16k,
+    codec_from_telnyx_payload,
+    normalize_g711_codec,
+    preferred_telnyx_codec,
+)
 from stella.config import Settings
 from stella.errors import StellaError
 from stella.energy_vad import EnergyVad, EnergyVadConfig, pcm_rms
@@ -270,8 +277,14 @@ class GeminiVoiceSession:
         self._assistant_bits: list[str] = []
         # Running dialog (both sides) so later tasks can carry the conversation context.
         self._dialog: list[list[str]] = []
-        self._up = Pcmu8kToPcm16k()
-        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
+        stored = getattr(job, "media_codec", "") or ""
+        self._codec = (
+            normalize_g711_codec(stored)
+            if stored
+            else preferred_telnyx_codec(job.to_number, settings.telnyx_from_number)
+        )
+        self._up = Pcmu8kToPcm16k(codec=self._codec)
+        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE, codec=self._codec)
         self.provider = "gemini"
         self.guard = TelnyxMediaGuard()
         self._setup_complete = asyncio.Event()
@@ -445,6 +458,10 @@ class GeminiVoiceSession:
                 event = msg.get("event")
                 if event in {"start", "media"}:
                     self.guard.mark_started()
+                if event == "start":
+                    detected = codec_from_telnyx_payload(msg.get("start") or msg)
+                    if detected:
+                        self._apply_codec(detected)
                 if event == "media":
                     media = msg.get("media") or {}
                     track = (media.get("track") or "").lower()
@@ -641,8 +658,17 @@ class GeminiVoiceSession:
 
     async def _on_barge_in(self) -> None:
         """Stop queued Telnyx playout when Gemini reports the user interrupted."""
-        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE)
+        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE, codec=self._codec)
         await self._send_telnyx_clear()
+
+    def _apply_codec(self, codec: str) -> None:
+        codec = normalize_g711_codec(codec)
+        if codec == self._codec:
+            return
+        logger.info("Telnyx bidirectional codec %s -> %s", self._codec, codec)
+        self._codec = codec
+        self._up = Pcmu8kToPcm16k(codec=codec)
+        self._down = PcmToPcmu8k(default_rate=GEMINI_OUT_RATE, codec=codec)
 
     async def _send_telnyx_clear(self) -> None:
         self.guard.clear_playout()

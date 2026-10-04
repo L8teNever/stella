@@ -12,9 +12,11 @@ def build_mcp(service: JobService) -> FastMCP:
     mcp = FastMCP(
         "stella",
         instructions=(
-            "Stella places outbound phone calls. Pass everything the agent needs "
-            "in brief/context. Stella has no direct access to Ida memory or other MCPs; only calls"
-            " to the owner number may use the live `frag_ida` lookup."
+            "Stella places outbound phone calls and automatically answers inbound "
+            "PSTN to TELNYX_FROM_NUMBER (owner by default). Use stella_call for "
+            "outbound; inbound needs no MCP. Pass everything the agent needs in "
+            "brief/context. Stella has no direct access to Ida memory or other MCPs; only calls"
+            " with the owner on the line may use the live `frag_ida` lookup."
         ),
         stateless_http=True,
     )
@@ -59,6 +61,19 @@ def build_mcp(service: JobService) -> FastMCP:
             return data
         except StellaError as exc:
             return exc.to_dict()
+
+    @mcp.tool()
+    def stella_recent_calls(limit: int = 10, kind: str = "") -> dict[str, Any]:
+        """List recent Stella jobs (outbound and inbound). Inbound is automatic when someone dials Stella.
+
+        `kind` optional: call | briefing | inbound. `stella_call_status` still returns one job + events.
+        """
+        try:
+            limit_n = int(limit)
+        except (TypeError, ValueError):
+            limit_n = 10
+        jobs = service.store.list_recent(limit=limit_n, kind=(kind or "").strip() or None)
+        return {"calls": [job.to_public_dict() for job in jobs]}
 
     @mcp.tool()
     def stella_briefing_call(

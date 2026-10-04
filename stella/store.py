@@ -17,7 +17,7 @@ def _now() -> str:
 @dataclass
 class CallJob:
     id: str
-    kind: str  # call | briefing
+    kind: str  # call | briefing | inbound
     to_number: str
     brief: str
     context: str
@@ -30,6 +30,7 @@ class CallJob:
     error: str
     voice_provider: str
     allow_ida: bool
+    media_codec: str
     created_at: str
     updated_at: str
 
@@ -48,6 +49,7 @@ class CallJob:
             "error": self.error or None,
             "voice_provider": self.voice_provider or None,
             "allow_ida": self.allow_ida,
+            "media_codec": self.media_codec or None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -99,6 +101,10 @@ class JobStore:
                 conn.execute("ALTER TABLE jobs ADD COLUMN allow_ida INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN media_codec TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -137,6 +143,7 @@ class JobStore:
             error="",
             voice_provider="",
             allow_ida=bool(allow_ida),
+            media_codec="",
             created_at=_now(),
             updated_at=_now(),
         )
@@ -146,8 +153,9 @@ class JobStore:
                 INSERT INTO jobs (
                     id, kind, to_number, brief, context, speak_to, status,
                     telnyx_call_control_id, telnyx_call_leg_id, outcome,
-                    transcript, error, voice_provider, allow_ida, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript, error, voice_provider, allow_ida, media_codec,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -164,6 +172,7 @@ class JobStore:
                     job.error,
                     job.voice_provider,
                     int(job.allow_ida),
+                    job.media_codec,
                     job.created_at,
                     job.updated_at,
                 ),
@@ -175,6 +184,19 @@ class JobStore:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row else None
+
+    def list_recent(self, limit: int = 10, kind: str | None = None) -> list[CallJob]:
+        limit = max(1, min(int(limit), 50))
+        sql = "SELECT * FROM jobs"
+        args: list[Any] = []
+        if kind:
+            sql += " WHERE kind = ?"
+            args.append(kind)
+        sql += " ORDER BY datetime(created_at) DESC, created_at DESC LIMIT ?"
+        args.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._row_to_job(row) for row in rows]
 
     def get_by_call_control_id(self, call_control_id: str) -> CallJob | None:
         with self._lock, self._connect() as conn:
@@ -245,6 +267,7 @@ class JobStore:
             error=row["error"],
             voice_provider=row["voice_provider"] if "voice_provider" in row.keys() else "",
             allow_ida=bool(row["allow_ida"]) if "allow_ida" in row.keys() else False,
+            media_codec=row["media_codec"] if "media_codec" in row.keys() else "",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

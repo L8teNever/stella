@@ -93,8 +93,8 @@ class TelnyxClient:
         return chosen if chosen in {"PCMU", "PCMA"} else CODEC_PCMU
 
     def _stream_fields(self, stream_url: str, codec: str) -> dict[str, Any]:
-        # inbound_track = far-end audio only. both_tracks would echo our
-        # outbound RTP back into the model and cause feedback / "swapped" audio.
+        # inbound_track = remote-party audio (caller on inbound, callee on
+        # outbound). both_tracks echoes our outbound RTP into the model.
         return {
             "stream_url": stream_url,
             "stream_track": "inbound_track",

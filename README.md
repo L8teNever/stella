@@ -5,7 +5,7 @@ Independent **voice / phone** stack. Ida dispatches outbound call **jobs** over 
 ```
 Ida / Cursor  --MCP-->  Stella HTTP
                             |  POST /v2/calls (outbound dial + stream_url)
-                            |  inbound: call.initiated → answer + streaming_start
+                            |  inbound: call.initiated → answer (stream_url once)
                             |  webhooks /webhooks/telnyx  → SQLite status
                             |  WS /media/{job_id}  <-->  Gemini Live
 ```
@@ -100,7 +100,7 @@ Stella dials E.164, starts **bidirectional media streaming** (PCMU or PCMA at 8 
 
 ### Inbound (dial Stella)
 
-When someone calls `TELNYX_FROM_NUMBER` (e.g. `+4973613809988`), Telnyx sends `call.initiated` with `direction: incoming`. Stella creates a `kind=inbound` job (`to` = caller), **answers**, and starts the same bidirectional stream as outbound (PCMA on DE).
+When someone calls `TELNYX_FROM_NUMBER` (e.g. `+4973613809988`), Telnyx sends `call.initiated` with `direction: incoming`. Stella creates a `kind=inbound` job (`to` = caller) and **answers with `stream_url` once** — same bidirectional fields as outbound dial (`stream_track=inbound_track` = remote-party audio, PCMA on DE). Do **not** also call `streaming_start`; that second connect returns Telnyx 422/90046 and can leave Gemini deaf to the caller.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

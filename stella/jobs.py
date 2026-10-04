@@ -327,6 +327,9 @@ class JobService:
         stream = self.settings.public_ws_url(f"/media/{job.id}")
         client_state = base64_json({"job_id": job.id})
         try:
+            # Embed the media stream on answer only — same as outbound dial.
+            # A second streaming_start races the first WS and Telnyx returns
+            # 422 90046 "Failed to connect to destination".
             self.telnyx.answer(
                 job.telnyx_call_control_id,
                 client_state=client_state,
@@ -339,17 +342,6 @@ class JobService:
             self.store.update(job.id, status="failed", error=exc.message)
             logger.warning("inbound answer failed: %s", exc.message)
             return
-        try:
-            self.telnyx.streaming_start(
-                job.telnyx_call_control_id,
-                stream_url=stream,
-                stream_bidirectional_codec=media_codec,
-                party_number=job.to_number,
-                client_state=client_state,
-            )
-        except StellaError as exc:
-            # Answer may already have started the stream.
-            logger.warning("inbound streaming_start: %s", exc.message)
         self.store.update(job.id, status="in_progress", voice_provider="gemini", media_codec=media_codec)
 
     def _reject_inbound_hangup(self, job: CallJob, reason: str) -> None:

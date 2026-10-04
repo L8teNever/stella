@@ -548,6 +548,45 @@ def test_dial_keeps_inbound_track_for_bidirectional(tmp_path):
     assert payload["stream_bidirectional_sampling_rate"] == 8000
 
 
+def test_answer_embeds_stream_fields_like_dial(tmp_path):
+    settings = make_settings(tmp_path, telnyx_from_number="+4973613809988")
+    telnyx = TelnyxClient(settings, transport=FakeTransport())
+    telnyx.answer(
+        "cc-in",
+        stream_url="wss://stella.example/media/job-1",
+        stream_bidirectional_codec="PCMA",
+        party_number="+4917660776356",
+        client_state="abc",
+        webhook_url="https://stella.example/webhooks/telnyx",
+    )
+    method, url, kwargs = telnyx._http.calls[0]
+    assert method == "POST"
+    assert url.endswith("/calls/cc-in/actions/answer")
+    payload = kwargs["json"]
+    assert payload["stream_url"] == "wss://stella.example/media/job-1"
+    assert payload["stream_track"] == "inbound_track"
+    assert payload["stream_bidirectional_codec"] == "PCMA"
+    assert payload["stream_bidirectional_mode"] == "rtp"
+    assert payload["client_state"] == "abc"
+    assert payload["webhook_url"] == "https://stella.example/webhooks/telnyx"
+
+
+def test_streaming_start_is_separate_action_not_used_with_answer_stream(tmp_path):
+    """streaming_start exists for a later start; inbound must not pair it with answer+stream."""
+    settings = make_settings(tmp_path, telnyx_from_number="+4973613809988")
+    telnyx = TelnyxClient(settings, transport=FakeTransport())
+    telnyx.streaming_start(
+        "cc-in",
+        stream_url="wss://stella.example/media/job-1",
+        stream_bidirectional_codec="PCMA",
+        party_number="+4917660776356",
+    )
+    method, url, kwargs = telnyx._http.calls[0]
+    assert url.endswith("/calls/cc-in/actions/streaming_start")
+    assert kwargs["json"]["stream_track"] == "inbound_track"
+    assert kwargs["json"]["stream_bidirectional_codec"] == "PCMA"
+
+
 def test_dial_uses_pcma_for_german_pstn(tmp_path):
     settings = make_settings(tmp_path, telnyx_from_number="+4973613809988")
     store = JobStore(settings.stella_db_path)
@@ -617,11 +656,10 @@ def test_inbound_owner_answers_and_starts_pcma_stream(tmp_path):
     answer = next(p for _, u, p in actions if u.endswith("/calls/cc-in-1/actions/answer"))
     assert answer["stream_url"].endswith(f"/media/{job.id}")
     assert answer["stream_bidirectional_codec"] == "PCMA"
-    stream_calls = [p for _, u, p in actions if u.endswith("/actions/streaming_start")]
-    assert len(stream_calls) == 1
-    assert stream_calls[0]["stream_url"].endswith(f"/media/{job.id}")
-    assert stream_calls[0]["stream_bidirectional_codec"] == "PCMA"
-    assert stream_calls[0]["stream_track"] == "inbound_track"
+    assert answer["stream_track"] == "inbound_track"
+    assert answer["stream_bidirectional_mode"] == "rtp"
+    assert answer["stream_bidirectional_sampling_rate"] == 8000
+    assert not any(u.endswith("/actions/streaming_start") for _, u, _ in actions)
     assert store.list_recent(kind="inbound")[0].id == job.id
 
 
@@ -694,7 +732,9 @@ def test_inbound_unknown_answer_has_no_ida(tmp_path):
     job = store.get_by_call_control_id("cc-in-4")
     assert job and job.status == "in_progress"
     assert job.allow_ida is False
-    assert any("/actions/streaming_start" in u for _, u, _ in transport.calls)
+    urls = [u for _, u, _ in transport.calls]
+    assert any(u.endswith("/actions/answer") for u in urls)
+    assert not any("/actions/streaming_start" in u for u in urls)
 
 
 def test_inbound_without_direction_still_answers_owner(tmp_path):
@@ -722,7 +762,9 @@ def test_inbound_without_direction_still_answers_owner(tmp_path):
     job = store.get_by_call_control_id("cc-in-5")
     assert job and job.status == "in_progress"
     assert job.to_number == owner
-    assert any("/actions/answer" in u for _, u, _ in transport.calls)
+    urls = [u for _, u, _ in transport.calls]
+    assert any("/actions/answer" in u for u in urls)
+    assert not any("/actions/streaming_start" in u for u in urls)
 
 
 def test_outbound_initiated_without_job_is_not_answered(tmp_path):

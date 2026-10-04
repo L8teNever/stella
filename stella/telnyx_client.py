@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from stella.audio_pcmu import CODEC_PCMU, preferred_telnyx_codec
 from stella.config import Settings
 from stella.errors import StellaError
 
@@ -61,8 +62,14 @@ class TelnyxClient:
         webhook_url: str,
         stream_url: str,
         client_state: str | None = None,
+        stream_bidirectional_codec: str | None = None,
     ) -> dict[str, Any]:
         self._require_config()
+        codec = stream_bidirectional_codec or preferred_telnyx_codec(
+            self.settings.telnyx_from_number, to
+        )
+        if codec not in {"PCMU", "PCMA"}:
+            codec = CODEC_PCMU
         payload: dict[str, Any] = {
             "to": to,
             "from": self.settings.telnyx_from_number,
@@ -74,7 +81,7 @@ class TelnyxClient:
             # outbound RTP back into the model and cause feedback / "swapped" audio.
             "stream_track": "inbound_track",
             "stream_bidirectional_mode": "rtp",
-            "stream_bidirectional_codec": "PCMU",
+            "stream_bidirectional_codec": codec,
             "stream_bidirectional_sampling_rate": 8000,
             "answering_machine_detection": "detect",
         }

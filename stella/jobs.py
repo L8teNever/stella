@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from stella.audio_pcmu import codec_from_telnyx_payload, preferred_telnyx_codec
 from stella.config import Settings
 from stella.ask_ida import ida_allowed_for
 from stella.errors import StellaError, normalize_e164
@@ -96,6 +97,7 @@ class JobService:
                 "gemini_key_missing",
             )
         provider = "gemini"
+        media_codec = preferred_telnyx_codec(self.settings.telnyx_from_number, to_e164)
         job = self.store.create(
             kind=kind,
             to_number=to_e164,
@@ -104,7 +106,7 @@ class JobService:
             speak_to=(speak_to or "").strip(),
             allow_ida=ida_allowed_for(self.settings, to_e164, allow_ida),
         )
-        self.store.update(job.id, voice_provider=provider)
+        self.store.update(job.id, voice_provider=provider, media_codec=media_codec)
         webhook = self.settings.public_http_url("/webhooks/telnyx")
         stream = self.settings.public_ws_url(f"/media/{job.id}")
         client_state = base64_json({"job_id": job.id})
@@ -114,6 +116,7 @@ class JobService:
                 webhook_url=webhook,
                 stream_url=stream,
                 client_state=client_state,
+                stream_bidirectional_codec=media_codec,
             )
         except StellaError as exc:
             self.store.update(job.id, status="failed", error=exc.message)
@@ -122,6 +125,7 @@ class JobService:
             job.id,
             status="dialing",
             voice_provider=provider,
+            media_codec=media_codec,
             telnyx_call_control_id=dialed.get("call_control_id") or "",
             telnyx_call_leg_id=dialed.get("call_leg_id") or "",
         )
@@ -188,6 +192,10 @@ class JobService:
             fields["status"] = "completed"
         if event_type == "streaming.failed":
             fields["error"] = str(payload.get("reason") or "media streaming failed")
+        if event_type in {"call.answered", "streaming.started"}:
+            detected = codec_from_telnyx_payload(payload)
+            if detected:
+                fields["media_codec"] = detected
         if fields:
             updated = self.store.update(job.id, **fields)
             if updated and event_type == "call.hangup":

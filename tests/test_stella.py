@@ -17,7 +17,13 @@ from stella.jobs import JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
 from stella.telnyx_client import TelnyxClient
-from stella.audio_pcmu import PcmToPcmu8k, Pcmu8kToPcm16k, parse_pcm_rate
+from stella.audio_pcmu import (
+    PcmToPcmu8k,
+    Pcmu8kToPcm16k,
+    codec_from_telnyx_payload,
+    parse_pcm_rate,
+    preferred_telnyx_codec,
+)
 from stella.gemini_voice import (
     DEFAULT_GEMINI_LIVE_MODEL,
     GEMINI_LIVE_SETUP_FALLBACKS,
@@ -489,6 +495,33 @@ def test_pcmu_24k_emits_aligned_20ms_frames():
     assert len(base64.b64decode(frames2[0])) == TELNYX_FRAME_BYTES
 
 
+def test_pcma_roundtrip_20ms_frames():
+    import audioop
+    from stella.audio_pcmu import SAMPLE_WIDTH, TELNYX_FRAME_BYTES, pack_pcm16le
+
+    pcm8 = pack_pcm16le([1200, -800, 400, 0] * 40)  # 160 samples @ 8 kHz
+    alaw = audioop.lin2alaw(pcm8, SAMPLE_WIDTH)
+    assert len(alaw) == TELNYX_FRAME_BYTES
+    up = Pcmu8kToPcm16k(codec="PCMA")
+    down = PcmToPcmu8k(default_rate=16000, codec="PCMA")
+    pcm16 = up.convert_b64(base64.b64encode(alaw).decode("ascii"))
+    assert len(pcm16) == 640
+    frames = down.convert_frames_b64(
+        base64.b64encode(pcm16).decode("ascii"), "audio/pcm;rate=16000"
+    )
+    assert len(frames) == 1
+    raw = base64.b64decode(frames[0])
+    assert len(raw) == TELNYX_FRAME_BYTES
+    # Round-trip stays A-law, not μ-law (μ-law silence is 0xFF).
+    decoded = audioop.alaw2lin(raw, SAMPLE_WIDTH)
+    assert len(decoded) == 320
+    assert preferred_telnyx_codec("+4973613809988", "+4915123456789") == "PCMA"
+    assert preferred_telnyx_codec("+14482020288", "+14155552671") == "PCMU"
+    assert codec_from_telnyx_payload({"codec": "PCMA", "sampling_rate": 8000}) == "PCMA"
+    assert codec_from_telnyx_payload({"media_format": {"encoding": "audio/x-alaw"}}) == "PCMA"
+    assert codec_from_telnyx_payload({"codec": "PCMU"}) == "PCMU"
+
+
 def test_gemini_voice_default_is_female(tmp_path):
     settings = make_settings(tmp_path)
     assert settings.gemini_voice == "Aoede"
@@ -506,6 +539,33 @@ def test_dial_keeps_inbound_track_for_bidirectional(tmp_path):
     assert payload["stream_bidirectional_mode"] == "rtp"
     assert payload["stream_bidirectional_codec"] == "PCMU"
     assert payload["stream_bidirectional_sampling_rate"] == 8000
+
+
+def test_dial_uses_pcma_for_german_pstn(tmp_path):
+    settings = make_settings(tmp_path, telnyx_from_number="+4973613809988")
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    telnyx = TelnyxClient(settings, transport=transport)
+    svc = JobService(settings, store, telnyx)
+    job = svc.place_call(to="+491701234567", brief="hello")
+    payload = transport.calls[0][2]["json"]
+    assert payload["stream_bidirectional_codec"] == "PCMA"
+    assert payload["stream_bidirectional_sampling_rate"] == 8000
+    assert store.get(job.id).media_codec == "PCMA"
+    svc.handle_telnyx_event(
+        {
+            "data": {
+                "event_type": "call.answered",
+                "payload": {
+                    "call_control_id": "cc-test-1",
+                    "codec": "PCMA",
+                    "sampling_rate": 8000,
+                },
+            }
+        }
+    )
+    assert store.get(job.id).media_codec == "PCMA"
+    assert store.get(job.id).status == "in_progress"
 
 
 def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):

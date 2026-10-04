@@ -95,7 +95,7 @@ The call is handled in a background task, so audio, VAD, hang-up and farewell gu
 3. Copy API key, connection id, and webhook public key.
 4. Point the connection’s webhook at `{STELLA_PUBLIC_BASE_URL}/webhooks/telnyx` (Stella also sends `webhook_url` on each dial).
 
-Stella dials E.164, starts **bidirectional media streaming** (PCMU 8 kHz) into `/media/{job_id}`, and bridges that socket to Gemini Live. Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
+Stella dials E.164, starts **bidirectional media streaming** (PCMU or PCMA at 8 kHz; PCMA for German +49 PSTN) into `/media/{job_id}`, and bridges that socket to Gemini Live. Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
 
 ## MCP (Ida / Cursor)
 

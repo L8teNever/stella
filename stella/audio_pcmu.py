@@ -1,8 +1,9 @@
-"""μ-law (PCMU 8 kHz) <-> linear PCM helpers for Telnyx <-> Gemini Live.
+"""G.711 (PCMU μ-law / PCMA A-law, 8 kHz) <-> linear PCM for Telnyx <-> Gemini.
 
-Telnyx bidirectional RTP expects PCMU frames whose payload length is a
-multiple of 160 bytes (20 ms at 8 kHz). Gemini Live uses 16-bit PCM
-little-endian (typically 16 kHz in, 24 kHz out).
+Telnyx bidirectional RTP expects G.711 frames whose payload length is a
+multiple of 160 bytes (20 ms at 8 kHz). German PSTN typically answers PCMA;
+US numbers typically use PCMU. Gemini Live uses 16-bit PCM little-endian
+(typically 16 kHz in, 24 kHz out).
 
 Downsampling 24 kHz -> 8 kHz with audioop.ratecv (linear interpolation)
 aliases badly and often emits a length that is not 20 ms-aligned. Sending
@@ -24,14 +25,83 @@ import numpy as np
 
 TELNYX_RATE = 8000
 TELNYX_FRAME_SAMPLES = 160  # 20 ms
-TELNYX_FRAME_BYTES = TELNYX_FRAME_SAMPLES  # μ-law is 1 byte/sample
+TELNYX_FRAME_BYTES = TELNYX_FRAME_SAMPLES  # G.711 is 1 byte/sample
 SAMPLE_WIDTH = 2
 GEMINI_IN_RATE = 16000
 GEMINI_OUT_RATE = 24000
+CODEC_PCMU = "PCMU"
+CODEC_PCMA = "PCMA"
+# μ-law 0xFF and A-law 0xD5 are the encodings of linear 0 (idle).
+G711_SILENCE = {CODEC_PCMU: b"\xff", CODEC_PCMA: b"\xd5"}
 
 _RATE_RE = re.compile(r"rate=(\d+)", re.IGNORECASE)
 _INT16_MIN = -32768
 _INT16_MAX = 32767
+
+
+def normalize_g711_codec(raw: object | None) -> str:
+    """Map Telnyx / SIP labels to PCMU or PCMA. Unknown values default to PCMU."""
+    text = str(raw or "").strip().upper()
+    compact = (
+        text.replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+        .replace(".", "")
+        .replace("/", "")
+    )
+    if any(token in compact for token in ("PCMA", "ALAW", "G711A")):
+        return CODEC_PCMA
+    return CODEC_PCMU
+
+
+def preferred_telnyx_codec(*e164: str | None) -> str:
+    """PCMA for German (+49) PSTN legs; PCMU otherwise (US μ-law)."""
+    for number in e164:
+        digits = "".join(ch for ch in str(number or "") if ch.isdigit())
+        if digits.startswith("49"):
+            return CODEC_PCMA
+    return CODEC_PCMU
+
+
+def codec_from_telnyx_payload(payload: dict | None) -> str | None:
+    """Read codec from call.answered / streaming / media start payloads."""
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[object] = [
+        payload.get("codec"),
+        payload.get("encoding"),
+        payload.get("stream_bidirectional_codec"),
+    ]
+    media_format = payload.get("media_format") or payload.get("mediaFormat")
+    if isinstance(media_format, dict):
+        candidates.append(media_format.get("encoding"))
+        candidates.append(media_format.get("codec"))
+    start = payload.get("start")
+    if isinstance(start, dict):
+        nested = codec_from_telnyx_payload(start)
+        if nested:
+            return nested
+    for raw in candidates:
+        if raw is None or str(raw).strip() == "":
+            continue
+        return normalize_g711_codec(raw)
+    return None
+
+
+def g711_to_lin(companded: bytes, codec: str) -> bytes:
+    if normalize_g711_codec(codec) == CODEC_PCMA:
+        return audioop.alaw2lin(companded, SAMPLE_WIDTH)
+    return audioop.ulaw2lin(companded, SAMPLE_WIDTH)
+
+
+def lin_to_g711(pcm_native: bytes, codec: str) -> bytes:
+    if normalize_g711_codec(codec) == CODEC_PCMA:
+        return audioop.lin2alaw(pcm_native, SAMPLE_WIDTH)
+    return audioop.lin2ulaw(pcm_native, SAMPLE_WIDTH)
+
+
+def g711_silence_byte(codec: str) -> bytes:
+    return G711_SILENCE[normalize_g711_codec(codec)]
 
 
 def parse_pcm_rate(mime: str | None, default: int) -> int:
@@ -144,41 +214,46 @@ class FirUpsampler2:
         return np.clip(np.rint(out), _INT16_MIN, _INT16_MAX).astype(int).tolist()
 
 
-def _split_pcmu_frames(ulaw: bytes) -> tuple[list[bytes], bytes]:
+def _split_g711_frames(companded: bytes) -> tuple[list[bytes], bytes]:
     frames: list[bytes] = []
     offset = 0
-    n = len(ulaw)
+    n = len(companded)
     while offset + TELNYX_FRAME_BYTES <= n:
-        frames.append(ulaw[offset : offset + TELNYX_FRAME_BYTES])
+        frames.append(companded[offset : offset + TELNYX_FRAME_BYTES])
         offset += TELNYX_FRAME_BYTES
-    return frames, ulaw[offset:]
+    return frames, companded[offset:]
+
+
+_split_pcmu_frames = _split_g711_frames
 
 
 class Pcmu8kToPcm16k:
-    """Telnyx media payload (base64 PCMU 8 kHz) -> 16-bit LE PCM 16 kHz mono."""
+    """Telnyx media payload (base64 G.711 8 kHz) -> 16-bit LE PCM 16 kHz mono."""
 
-    def __init__(self) -> None:
+    def __init__(self, codec: str = CODEC_PCMU) -> None:
+        self.codec = normalize_g711_codec(codec)
         self._odd = b""
         self._up = FirUpsampler2()
 
     def convert_b64(self, pcmu_b64: str) -> bytes:
         try:
-            ulaw = base64.b64decode(pcmu_b64)
+            companded = base64.b64decode(pcmu_b64)
         except Exception:
             return b""
-        if not ulaw:
+        if not companded:
             return b""
-        # ulaw2lin emits native-endian 16-bit; pack back as LE for Gemini.
-        native = audioop.ulaw2lin(ulaw, SAMPLE_WIDTH)
+        # audioop *law2lin emits native-endian 16-bit; pack back as LE for Gemini.
+        native = g711_to_lin(companded, self.codec)
         samples = list(struct.unpack_from("h" * (len(native) // SAMPLE_WIDTH), native, 0))
         pcm16 = self._up.process(samples)
         return pack_pcm16le(pcm16)
 
 
 class PcmToPcmu8k:
-    """Gemini Live PCM (typically 24 kHz 16-bit LE) -> 20 ms base64 PCMU frames."""
+    """Gemini Live PCM (typically 24 kHz 16-bit LE) -> 20 ms base64 G.711 frames."""
 
-    def __init__(self, default_rate: int = GEMINI_OUT_RATE) -> None:
+    def __init__(self, default_rate: int = GEMINI_OUT_RATE, codec: str = CODEC_PCMU) -> None:
+        self.codec = normalize_g711_codec(codec)
         self._default_rate = default_rate
         self._ratecv_state: tuple | None = None
         self._rate = default_rate
@@ -222,8 +297,8 @@ class PcmToPcmu8k:
             )
             pcm8 = unpack_pcm16le(converted)
 
-        ulaw = self._ulaw_leftover + audioop.lin2ulaw(pack_pcm16le(pcm8), SAMPLE_WIDTH)
-        frames, self._ulaw_leftover = _split_pcmu_frames(ulaw)
+        ulaw = self._ulaw_leftover + lin_to_g711(pack_pcm16le(pcm8), self.codec)
+        frames, self._ulaw_leftover = _split_g711_frames(ulaw)
         return [base64.b64encode(f).decode("ascii") for f in frames]
 
     def convert_b64(self, pcm_b64: str, mime: str | None = None) -> str:
@@ -234,10 +309,10 @@ class PcmToPcmu8k:
         return base64.b64encode(joined).decode("ascii")
 
     def flush_frames_b64(self) -> list[str]:
-        """Pad any leftover μ-law to one last 20 ms frame (μ-law 0xFF ≈ silence)."""
+        """Pad leftover G.711 to one last 20 ms frame (codec idle byte ≈ silence)."""
         if not self._ulaw_leftover:
             return []
         pad = TELNYX_FRAME_BYTES - len(self._ulaw_leftover)
-        frame = self._ulaw_leftover + b"\xff" * pad
+        frame = self._ulaw_leftover + g711_silence_byte(self.codec) * pad
         self._ulaw_leftover = b""
         return [base64.b64encode(frame).decode("ascii")]

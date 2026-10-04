@@ -30,6 +30,7 @@ class CallJob:
     error: str
     voice_provider: str
     allow_ida: bool
+    media_codec: str
     created_at: str
     updated_at: str
 
@@ -48,6 +49,7 @@ class CallJob:
             "error": self.error or None,
             "voice_provider": self.voice_provider or None,
             "allow_ida": self.allow_ida,
+            "media_codec": self.media_codec or None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -99,6 +101,10 @@ class JobStore:
                 conn.execute("ALTER TABLE jobs ADD COLUMN allow_ida INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN media_codec TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -137,6 +143,7 @@ class JobStore:
             error="",
             voice_provider="",
             allow_ida=bool(allow_ida),
+            media_codec="",
             created_at=_now(),
             updated_at=_now(),
         )
@@ -146,8 +153,9 @@ class JobStore:
                 INSERT INTO jobs (
                     id, kind, to_number, brief, context, speak_to, status,
                     telnyx_call_control_id, telnyx_call_leg_id, outcome,
-                    transcript, error, voice_provider, allow_ida, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transcript, error, voice_provider, allow_ida, media_codec,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -164,6 +172,7 @@ class JobStore:
                     job.error,
                     job.voice_provider,
                     int(job.allow_ida),
+                    job.media_codec,
                     job.created_at,
                     job.updated_at,
                 ),
@@ -245,6 +254,7 @@ class JobStore:
             error=row["error"],
             voice_provider=row["voice_provider"] if "voice_provider" in row.keys() else "",
             allow_ida=bool(row["allow_ida"]) if "allow_ida" in row.keys() else False,
+            media_codec=row["media_codec"] if "media_codec" in row.keys() else "",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

@@ -54,6 +54,8 @@ class FakeTransport:
                 }
             }
             return httpx.Response(200, json=body)
+        if any(action in url for action in ("/actions/answer", "/actions/streaming_start", "/actions/speak", "/actions/hangup")):
+            return httpx.Response(200, json={"data": {"result": "ok"}})
         if "hangup" in url:
             return httpx.Response(200, json={"data": {"result": "ok"}})
         return httpx.Response(404, json={"errors": [{"detail": "not mocked"}]})
@@ -204,7 +206,12 @@ def test_mcp_tools_registered(tmp_path):
     svc = JobService(settings, store, TelnyxClient(settings, FakeTransport()))
     mcp = build_mcp(svc)
     names = {t.name for t in mcp._tool_manager.list_tools()}
-    assert names == {"stella_call", "stella_call_status", "stella_briefing_call"}
+    assert names == {
+        "stella_call",
+        "stella_call_status",
+        "stella_briefing_call",
+        "stella_recent_calls",
+    }
 
 
 def test_health_and_call_http(tmp_path):
@@ -566,6 +573,173 @@ def test_dial_uses_pcma_for_german_pstn(tmp_path):
     )
     assert store.get(job.id).media_codec == "PCMA"
     assert store.get(job.id).status == "in_progress"
+
+
+def _inbound_initiated(*, ccid: str, frm: str, to: str, direction: str = "incoming") -> dict:
+    return {
+        "data": {
+            "event_type": "call.initiated",
+            "payload": {
+                "call_control_id": ccid,
+                "call_leg_id": "leg-in-1",
+                "direction": direction,
+                "from": frm,
+                "to": to,
+            },
+        }
+    }
+
+
+def test_inbound_owner_answers_and_starts_pcma_stream(tmp_path):
+    owner = "+4917612345678"
+    stella_de = "+4973613809988"
+    settings = make_settings(
+        tmp_path,
+        telnyx_from_number=stella_de,
+        stella_owner_number=owner,
+        ask_ida_enabled=True,
+    )
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(_inbound_initiated(ccid="cc-in-1", frm=owner, to=stella_de))
+    jobs = store.list_recent(kind="inbound")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.kind == "inbound"
+    assert job.to_number == owner
+    assert job.speak_to == "Simon"
+    assert job.allow_ida is True
+    assert job.media_codec == "PCMA"
+    assert job.status == "in_progress"
+    assert job.telnyx_call_control_id == "cc-in-1"
+    actions = [(m, u, kw["json"]) for m, u, kw in transport.calls]
+    answer = next(p for _, u, p in actions if u.endswith("/calls/cc-in-1/actions/answer"))
+    assert answer["stream_url"].endswith(f"/media/{job.id}")
+    assert answer["stream_bidirectional_codec"] == "PCMA"
+    stream_calls = [p for _, u, p in actions if u.endswith("/actions/streaming_start")]
+    assert len(stream_calls) == 1
+    assert stream_calls[0]["stream_url"].endswith(f"/media/{job.id}")
+    assert stream_calls[0]["stream_bidirectional_codec"] == "PCMA"
+    assert stream_calls[0]["stream_track"] == "inbound_track"
+    assert store.list_recent(kind="inbound")[0].id == job.id
+
+
+def test_inbound_unknown_hangs_up_by_default(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        telnyx_from_number="+4973613809988",
+        stella_owner_number="+4917612345678",
+    )
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(
+        _inbound_initiated(ccid="cc-in-2", frm="+4915112345678", to="+4973613809988")
+    )
+    job = store.list_recent(kind="inbound")[0]
+    assert job.status == "rejected"
+    assert job.allow_ida is False
+    urls = [u for _, u, _ in transport.calls]
+    assert any(u.endswith("/actions/hangup") for u in urls)
+    assert not any("/actions/answer" in u for u in urls)
+    assert not any("/actions/streaming_start" in u for u in urls)
+
+
+def test_inbound_unknown_speak_then_hangup(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        telnyx_from_number="+4973613809988",
+        stella_owner_number="+4917612345678",
+        stella_inbound_unknown="speak",
+    )
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(
+        _inbound_initiated(ccid="cc-in-3", frm="+4915112345678", to="+4973613809988")
+    )
+    job = store.get_by_call_control_id("cc-in-3")
+    assert job and job.status == "rejecting"
+    urls = [u for _, u, _ in transport.calls]
+    assert any(u.endswith("/actions/answer") for u in urls)
+    assert any(u.endswith("/actions/speak") for u in urls)
+    assert not any("/actions/streaming_start" in u for u in urls)
+    svc.handle_telnyx_event(
+        {
+            "data": {
+                "event_type": "call.speak.ended",
+                "payload": {"call_control_id": "cc-in-3"},
+            }
+        }
+    )
+    assert store.get(job.id).status == "rejected"
+    assert any(u.endswith("/actions/hangup") for _, u, _ in transport.calls)
+
+
+def test_inbound_unknown_answer_has_no_ida(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        telnyx_from_number="+4973613809988",
+        stella_owner_number="+4917612345678",
+        ask_ida_enabled=True,
+        stella_inbound_unknown="answer",
+    )
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(
+        _inbound_initiated(ccid="cc-in-4", frm="+4915112345678", to="+4973613809988")
+    )
+    job = store.get_by_call_control_id("cc-in-4")
+    assert job and job.status == "in_progress"
+    assert job.allow_ida is False
+    assert any("/actions/streaming_start" in u for _, u, _ in transport.calls)
+
+
+def test_inbound_without_direction_still_answers_owner(tmp_path):
+    owner = "+4917612345678"
+    settings = make_settings(
+        tmp_path,
+        telnyx_from_number="+4973613809988",
+        stella_owner_number=owner,
+    )
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(
+        {
+            "data": {
+                "event_type": "call.initiated",
+                "payload": {
+                    "call_control_id": "cc-in-5",
+                    "from": {"phone_number": owner},
+                    "to": "sip:+4973613809988@sip.telnyx.com",
+                },
+            }
+        }
+    )
+    job = store.get_by_call_control_id("cc-in-5")
+    assert job and job.status == "in_progress"
+    assert job.to_number == owner
+    assert any("/actions/answer" in u for _, u, _ in transport.calls)
+
+
+def test_outbound_initiated_without_job_is_not_answered(tmp_path):
+    settings = make_settings(tmp_path, telnyx_from_number="+4973613809988")
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    svc.handle_telnyx_event(
+        _inbound_initiated(
+            ccid="cc-out-orphan",
+            frm="+4973613809988",
+            to="+14155552671",
+            direction="outgoing",
+        )
+    )
+    assert store.list_recent() == []
+    assert transport.calls == []
 
 
 def test_gemini_url_hides_nothing_but_uses_query_key(tmp_path):

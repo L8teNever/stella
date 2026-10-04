@@ -76,8 +76,21 @@ class Settings(BaseSettings):
     master_prompt_entity: str = "Master-Prompt"
     master_prompt_server: str = "Ida_Memory"  # key in ASK_IDA_MCP_CONFIG
     master_prompt_refresh_s: float = 60.0
-    # frag_ida is offered only on calls to this E.164 number.
+    # frag_ida is offered only when the party on the line is this E.164 number
+    # (outbound dest or inbound caller).
     stella_owner_number: str = ""
+    # Incoming PSTN to TELNYX_FROM_NUMBER. owner always answered when enabled;
+    # unknown callers follow stella_inbound_unknown.
+    stella_inbound_enabled: bool = True
+    # hangup | speak | answer
+    stella_inbound_unknown: str = "hangup"
+    stella_inbound_reject_text: str = "Diese Nummer ist nicht erreichbar."
+    stella_inbound_brief: str = (
+        "Du bist Stella. Simon ruft an — führe ein normales kurzes Gespräch auf Deutsch."
+    )
+    stella_inbound_unknown_brief: str = (
+        "Unbekannter Anrufer. Keine persönlichen Daten. Kurz und höflich, dann auflegen."
+    )
     # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.
     anthropic_api_key: str = ""
     claude_code_oauth_token: str = ""

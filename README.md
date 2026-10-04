@@ -1,10 +1,11 @@
 # Stella
 
-Independent **voice / phone** stack. Ida dispatches a call **job** over MCP. Stella places the call with **Telnyx Call Control** and talks with **Gemini Live** (`GEMINI_API_KEY`). Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. The one exception is the optional [`frag_ida`](#frag-ida-claude-code-im-anruf) lookup, available only on calls to the owner’s own number.
+Independent **voice / phone** stack. Ida dispatches outbound call **jobs** over MCP. Stella also **answers inbound PSTN** to `TELNYX_FROM_NUMBER` (no MCP). Talks with **Gemini Live** (`GEMINI_API_KEY`) over **Telnyx Call Control**. Stella does **not** share Ida’s live chat, memory, or other MCPs — only `brief` + optional `context` from the job. If the other party asks something that is not in that payload, Stella says she does not know. The one exception is the optional [`frag_ida`](#frag-ida-claude-code-im-anruf) lookup, available only when the **owner** is on the line (outbound dest or inbound caller).
 
 ```
 Ida / Cursor  --MCP-->  Stella HTTP
-                            |  POST /v2/calls (Telnyx dial + stream_url)
+                            |  POST /v2/calls (outbound dial + stream_url)
+                            |  inbound: call.initiated → answer + streaming_start
                             |  webhooks /webhooks/telnyx  → SQLite status
                             |  WS /media/{job_id}  <-->  Gemini Live
 ```
@@ -75,7 +76,7 @@ The call is handled in a background task, so audio, VAD, hang-up and farewell gu
 
 **Security model**
 
-- `frag_ida` is offered only if `ASK_IDA_ENABLED=true` **and** the dialed number equals `STELLA_OWNER_NUMBER` (checked at dial time, stored as `allow_ida` on the job, and re-checked when the media session starts). `stella_call`/`stella_briefing_call` accept `allow_ida=false` to switch it off; `true` never overrides the number check. Calls to anyone else get no such tool and Stella says she doesn’t know.
+- `frag_ida` is offered only if `ASK_IDA_ENABLED=true` **and** the party on the line equals `STELLA_OWNER_NUMBER` (outbound dest or inbound caller; stored as `allow_ida`, re-checked when the media session starts). `stella_call`/`stella_briefing_call` accept `allow_ida=false` to switch it off; `true` never overrides the number check. Calls with anyone else get no such tool and Stella says she doesn’t know.
 - Only tools in `ASK_IDA_ALLOWED_TOOLS` (exact `mcp__<server>__<tool>` names, **read-only**) are usable; anything else is denied by Claude Code (`--permission-mode dontAsk`). `ASK_IDA_DENY_TOOLS` always wins (default: SSH, Cloudflare, delete/clear tools).
 - Optional `ASK_IDA_WRITE_TOOLS` (empty by default) are only unlocked when Gemini passes `bestaetigt=true`, which it must do only after Simon explicitly says yes to a spoken “Soll ich das wirklich machen?”. This confirmation is model-enforced, not cryptographic; keep the list empty unless you accept that.
 - Prompt injection (e.g. a malicious mail) is mitigated by the read-only allowlist and the system prompt, not eliminated.
@@ -96,6 +97,19 @@ The call is handled in a background task, so audio, VAD, hang-up and farewell gu
 4. Point the connection’s webhook at `{STELLA_PUBLIC_BASE_URL}/webhooks/telnyx` (Stella also sends `webhook_url` on each dial).
 
 Stella dials E.164, starts **bidirectional media streaming** (PCMU or PCMA at 8 kHz; PCMA for German +49 PSTN) into `/media/{job_id}`, and bridges that socket to Gemini Live. Call events (`call.initiated`, `call.answered`, `call.hangup`, streaming failures) are persisted and returned from MCP `stella_call_status`.
+
+### Inbound (dial Stella)
+
+When someone calls `TELNYX_FROM_NUMBER` (e.g. `+4973613809988`), Telnyx sends `call.initiated` with `direction: incoming`. Stella creates a `kind=inbound` job (`to` = caller), **answers**, and starts the same bidirectional stream as outbound (PCMA on DE).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `STELLA_INBOUND_ENABLED` | `true` | Master switch. `false` hangs up every inbound call. |
+| `STELLA_OWNER_NUMBER` | empty | Simon’s E.164. Always answered when inbound is on. |
+| `STELLA_INBOUND_UNKNOWN` | `hangup` | Other callers: `hangup`, `speak` (play `STELLA_INBOUND_REJECT_TEXT` then hang up), or `answer` (talk, **no** `frag_ida`). |
+| `STELLA_INBOUND_BRIEF` | German chat with Simon | Gemini brief for owner inbound. |
+
+Inbound is **automatic** — no MCP tool to “pick up”. Use `stella_recent_calls` / `stella_call_status` to see jobs. Point the Call Control connection webhook at `/webhooks/telnyx` (same as outbound).
 
 ## MCP (Ida / Cursor)
 
@@ -145,7 +159,9 @@ Or locally after `pip install -e .`: `stella mcp` / `stella-mcp`.
 | `context` | no | Extra free text from Ida |
 | `speak_to` | no | Human label (“Simon”, “the restaurant”) |
 
-**`stella_call_status`** — `call_id` from the place-call response. Returns status, outcome, transcript, Telnyx events.
+**`stella_call_status`** — `call_id` from the place-call response or an inbound job. Returns status, outcome, transcript, Telnyx events.
+
+**`stella_recent_calls`** — last jobs (`limit`, optional `kind`: `call` / `briefing` / `inbound`). Inbound appears here when someone dials Stella.
 
 **`stella_briefing_call`** — `to` + `text` to read aloud (morning briefing), then hang up.
 

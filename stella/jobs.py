@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 BERLIN = ZoneInfo("Europe/Berlin")
 MAX_SCHEDULE_AHEAD = timedelta(days=14)
 _HHMM = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:uhr)?\s*$", re.IGNORECASE)
+INBOUND_UNKNOWN_MODES = frozenset({"hangup", "speak", "answer"})
+DEFAULT_INBOUND_BRIEF = (
+    "Du bist Stella. Simon ruft an — führe ein normales kurzes Gespräch auf Deutsch."
+)
 
 
 def parse_run_at(
@@ -155,9 +159,20 @@ class JobService:
 
     def handle_telnyx_event(self, body: dict[str, Any]) -> None:
         data = body.get("data") or body
-        event_type = data.get("event_type") or body.get("event_type") or ""
-        payload = data.get("payload") or {}
-        ccid = payload.get("call_control_id") or ""
+        payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+        if not payload.get("call_control_id") and (
+            data.get("call_control_id") or body.get("call_control_id")
+        ):
+            payload = {**{k: v for k, v in data.items() if k != "payload"}, **payload}
+        event_type = str(
+            data.get("event_type") or body.get("event_type") or payload.get("event_type") or ""
+        )
+        ccid = str(
+            payload.get("call_control_id")
+            or data.get("call_control_id")
+            or body.get("call_control_id")
+            or ""
+        )
         client_state = payload.get("client_state")
         job = None
         if ccid:
@@ -166,6 +181,11 @@ class JobService:
             job_id = decode_client_state(client_state).get("job_id")
             if job_id:
                 job = self.store.get(job_id)
+        # Any non-outbound initiated without a job is inbound (direction optional).
+        if job is None and event_type == "call.initiated" and ccid and not self._looks_outbound(payload):
+            job = self._accept_or_reject_inbound(payload)
+            if job is None:
+                return
         if job is None:
             logger.warning("Telnyx event %s for unknown call %s", event_type, ccid)
             return
@@ -181,7 +201,14 @@ class JobService:
         }
         new_status = status_map.get(event_type)
         fields: dict[str, Any] = {}
-        if new_status:
+        # Do not demote inbound after answer/reject (initiated would overwrite in_progress).
+        inbound_locked = job.kind == "inbound" and job.status in {
+            "in_progress",
+            "rejected",
+            "rejecting",
+            "failed",
+        }
+        if new_status and not (event_type == "call.initiated" and inbound_locked):
             fields["status"] = new_status
         if ccid and not job.telnyx_call_control_id:
             fields["telnyx_call_control_id"] = ccid
@@ -196,10 +223,159 @@ class JobService:
             detected = codec_from_telnyx_payload(payload)
             if detected:
                 fields["media_codec"] = detected
+        if event_type == "call.speak.ended" and job.kind == "inbound" and job.status == "rejecting":
+            try:
+                self.telnyx.hangup(job.telnyx_call_control_id or ccid)
+            except StellaError as exc:
+                logger.warning("inbound reject hangup failed: %s", exc.message)
+            fields["status"] = "rejected"
         if fields:
             updated = self.store.update(job.id, **fields)
             if updated and event_type == "call.hangup":
                 self._maybe_callback(updated)
+
+    def _looks_outbound(self, payload: dict[str, Any]) -> bool:
+        direction = str(
+            payload.get("direction") or payload.get("call_direction") or ""
+        ).strip().lower()
+        return direction in {"outgoing", "outbound"}
+
+    def _same_number(self, a: str, b: str) -> bool:
+        left, right = party_e164(a), party_e164(b)
+        return bool(left and right and left == right)
+
+    def _inbound_unknown_mode(self) -> str:
+        mode = (self.settings.stella_inbound_unknown or "hangup").strip().lower()
+        return mode if mode in INBOUND_UNKNOWN_MODES else "hangup"
+
+    def _accept_or_reject_inbound(self, payload: dict[str, Any]) -> CallJob | None:
+        ccid = str(payload.get("call_control_id") or "")
+        if not ccid:
+            logger.warning("Inbound call.initiated without call_control_id")
+            return None
+        existing = self.store.get_by_call_control_id(ccid)
+        if existing:
+            return existing
+        caller = (
+            party_e164(payload.get("from"))
+            or party_e164(payload.get("caller_id_number"))
+            or party_e164(payload.get("from_number"))
+            or "unknown"
+        )
+        dest = (
+            party_e164(payload.get("to"))
+            or party_e164(payload.get("to_number"))
+            or party_e164(self.settings.telnyx_from_number)
+        )
+        owner_cfg = (self.settings.stella_owner_number or "").strip()
+        owner = self._same_number(caller, owner_cfg)
+        enabled = bool(self.settings.stella_inbound_enabled)
+        mode = self._inbound_unknown_mode()
+        dest_ours = self._same_number(dest, self.settings.telnyx_from_number) or not dest
+        # Owner always; no owner configured → answer inbound to our DID; else unknown policy.
+        accept = enabled and (owner or mode == "answer" or (not owner_cfg and dest_ours))
+        logger.info(
+            "inbound call %s from %s to %s owner=%s accept=%s",
+            ccid,
+            caller,
+            dest,
+            owner,
+            accept,
+        )
+        media_codec = preferred_telnyx_codec(
+            self.settings.telnyx_from_number, dest, caller if caller != "unknown" else None
+        )
+        brief = (self.settings.stella_inbound_brief or "").strip() or DEFAULT_INBOUND_BRIEF
+        if accept and not owner:
+            brief = (self.settings.stella_inbound_unknown_brief or "").strip() or brief
+        speak_to = "Simon" if owner else "Anrufer"
+        job = self.store.create(
+            kind="inbound",
+            to_number=caller,
+            brief=brief,
+            context=f"inbound to {dest or self.settings.telnyx_from_number}",
+            speak_to=speak_to,
+            allow_ida=ida_allowed_for(self.settings, caller),
+        )
+        self.store.update(
+            job.id,
+            voice_provider="gemini",
+            media_codec=media_codec,
+            telnyx_call_control_id=ccid,
+            telnyx_call_leg_id=str(payload.get("call_leg_id") or ""),
+            status="initiated",
+        )
+        job = self.store.get(job.id)
+        assert job is not None
+        if accept:
+            self._answer_inbound(job, media_codec)
+        elif enabled and mode == "speak":
+            self._reject_inbound_speak(job)
+        else:
+            self._reject_inbound_hangup(job, "inbound disabled" if not enabled else "unknown caller")
+        return self.store.get(job.id)
+
+    def _answer_inbound(self, job: CallJob, media_codec: str) -> None:
+        if not (self.settings.gemini_api_key or "").strip():
+            self.store.update(job.id, status="failed", error="GEMINI_API_KEY is not set.")
+            try:
+                self.telnyx.hangup(job.telnyx_call_control_id)
+            except StellaError as exc:
+                logger.warning("inbound hangup after missing Gemini key: %s", exc.message)
+            return
+        webhook = self.settings.public_http_url("/webhooks/telnyx")
+        stream = self.settings.public_ws_url(f"/media/{job.id}")
+        client_state = base64_json({"job_id": job.id})
+        try:
+            self.telnyx.answer(
+                job.telnyx_call_control_id,
+                client_state=client_state,
+                webhook_url=webhook,
+                stream_url=stream,
+                stream_bidirectional_codec=media_codec,
+                party_number=job.to_number,
+            )
+        except StellaError as exc:
+            self.store.update(job.id, status="failed", error=exc.message)
+            logger.warning("inbound answer failed: %s", exc.message)
+            return
+        try:
+            self.telnyx.streaming_start(
+                job.telnyx_call_control_id,
+                stream_url=stream,
+                stream_bidirectional_codec=media_codec,
+                party_number=job.to_number,
+                client_state=client_state,
+            )
+        except StellaError as exc:
+            # Answer may already have started the stream.
+            logger.warning("inbound streaming_start: %s", exc.message)
+        self.store.update(job.id, status="in_progress", voice_provider="gemini", media_codec=media_codec)
+
+    def _reject_inbound_hangup(self, job: CallJob, reason: str) -> None:
+        try:
+            self.telnyx.hangup(job.telnyx_call_control_id)
+        except StellaError as exc:
+            logger.warning("inbound reject hangup failed: %s", exc.message)
+        self.store.update(job.id, status="rejected", outcome=reason)
+
+    def _reject_inbound_speak(self, job: CallJob) -> None:
+        text = (self.settings.stella_inbound_reject_text or "").strip() or (
+            "Diese Nummer ist nicht erreichbar."
+        )
+        try:
+            self.telnyx.answer(job.telnyx_call_control_id)
+            self.telnyx.speak(job.telnyx_call_control_id, text, language="de-DE")
+        except StellaError as exc:
+            logger.warning("inbound reject speak failed: %s", exc.message)
+            self._reject_inbound_hangup(job, "unknown caller")
+            return
+        self.store.update(
+            job.id,
+            status="rejecting",
+            outcome="unknown caller",
+            allow_ida=False,
+        )
 
     def hangup(self, job: CallJob) -> None:
         if job.telnyx_call_control_id:
@@ -222,6 +398,40 @@ def base64_json(obj: dict[str, Any]) -> str:
     import base64
 
     return base64.b64encode(json.dumps(obj).encode("utf-8")).decode("ascii")
+
+
+def party_e164(raw: Any) -> str:
+    if isinstance(raw, dict):
+        raw = (
+            raw.get("phone_number")
+            or raw.get("number")
+            or raw.get("from")
+            or raw.get("to")
+            or ""
+        )
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    for prefix in ("sip:", "sips:", "tel:"):
+        if lower.startswith(prefix):
+            text = text[len(prefix) :]
+            lower = text.lower()
+            break
+    if "@" in text:
+        text = text.split("@", 1)[0]
+    text = text.strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if text.startswith("+"):
+        candidate = "+" + digits
+    elif digits:
+        candidate = "+" + digits
+    else:
+        candidate = text
+    try:
+        return normalize_e164(candidate)
+    except StellaError:
+        return ""
 
 
 def decode_client_state(raw: str) -> dict[str, Any]:

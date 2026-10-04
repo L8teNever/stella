@@ -17,7 +17,7 @@ def _now() -> str:
 @dataclass
 class CallJob:
     id: str
-    kind: str  # call | briefing
+    kind: str  # call | briefing | inbound
     to_number: str
     brief: str
     context: str
@@ -184,6 +184,19 @@ class JobStore:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row else None
+
+    def list_recent(self, limit: int = 10, kind: str | None = None) -> list[CallJob]:
+        limit = max(1, min(int(limit), 50))
+        sql = "SELECT * FROM jobs"
+        args: list[Any] = []
+        if kind:
+            sql += " WHERE kind = ?"
+            args.append(kind)
+        sql += " ORDER BY datetime(created_at) DESC, created_at DESC LIMIT ?"
+        args.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._row_to_job(row) for row in rows]
 
     def get_by_call_control_id(self, call_control_id: str) -> CallJob | None:
         with self._lock, self._connect() as conn:

@@ -63,7 +63,7 @@ def resolve_tools(settings: Settings, confirmed: bool) -> tuple[list[str], list[
 
 
 def ida_allowed_for(settings: Settings, to_number: str, requested: bool | None = None) -> bool:
-    """frag_ida only for calls to STELLA_OWNER_NUMBER, and only if enabled."""
+    """frag_ida only when the party on the line is STELLA_OWNER_NUMBER (if enabled)."""
     if not settings.ask_ida_enabled:
         return False
     owner = (settings.stella_owner_number or "").strip()

@@ -1055,6 +1055,74 @@ def test_energy_vad_emits_start_then_end_after_silence():
     assert events == ["end"]
 
 
+def test_energy_vad_quiet_barge_in_still_min_speech_ms():
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=120))
+    events: list[str] = []
+    events.extend(vad.feed(_pcm16_frame(8000)))  # 20 ms
+    assert events == []
+    events.extend(vad.feed(_pcm16_frame(8000)))  # 40 ms
+    assert events == []
+    events.extend(vad.feed(_pcm16_frame(8000)))  # 60 ms
+    assert events == ["start"]
+
+
+def test_energy_vad_quiet_end_latency_matches_silence_ms():
+    """Quiet-room turn gap is still exactly silence_ms (no extra confirmation)."""
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    silence_ms = 120
+    vad = EnergyVad(
+        EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
+    )
+    for _ in range(4):
+        vad.feed(_pcm16_frame(8000))
+    assert vad.speaking
+    frames = silence_ms // 20
+    events: list[str] = []
+    for i in range(frames):
+        events.extend(vad.feed(_pcm16_frame(0)))
+        if i < frames - 1:
+            assert events == []
+            assert vad.speaking
+    assert events == ["end"]
+
+
+def test_energy_vad_ignores_steady_engine_noise():
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=120))
+    events: list[str] = []
+    for _ in range(80):
+        events.extend(vad.feed(_pcm16_frame(1500)))
+    assert events == []
+    assert not vad.speaking
+
+
+def test_energy_vad_ends_turn_on_engine_after_speech():
+    """After a real utterance, cabin noise must not hold VAD open past silence_ms."""
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    silence_ms = 120
+    vad = EnergyVad(
+        EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
+    )
+    for _ in range(40):
+        assert vad.feed(_pcm16_frame(1500)) == []
+    events: list[str] = []
+    for _ in range(4):
+        events.extend(vad.feed(_pcm16_frame(9000)))
+    assert events == ["start"]
+    events = []
+    frames = silence_ms // 20
+    for i in range(frames):
+        events.extend(vad.feed(_pcm16_frame(1500)))
+        if i < frames - 1:
+            assert events == []
+    assert events == ["end"]
+
+
 def test_gemini_setup_client_vad_disables_automatic(tmp_path):
     settings = make_settings(tmp_path, gemini_api_key="g-key", stella_client_vad=True)
     store = JobStore(settings.stella_db_path)

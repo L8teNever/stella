@@ -19,7 +19,7 @@ from stella.audio_pcmu import (
 )
 from stella.config import Settings
 from stella.errors import StellaError
-from stella.energy_vad import EnergyVad, EnergyVadConfig, pcm_rms
+from stella.energy_vad import EnergyVad, energy_vad_config_from_settings, pcm_rms
 from stella.store import CallJob
 from stella.voice import (
     KICKOFF_TEXT,
@@ -288,13 +288,7 @@ class GeminiVoiceSession:
         self.provider = "gemini"
         self.guard = TelnyxMediaGuard()
         self._setup_complete = asyncio.Event()
-        self._vad = EnergyVad(
-            EnergyVadConfig(
-                rms_threshold=int(settings.stella_client_vad_rms),
-                min_speech_ms=int(settings.stella_client_vad_min_speech_ms),
-                silence_ms=int(settings.stella_client_vad_silence_ms),
-            )
-        )
+        self._vad = EnergyVad(energy_vad_config_from_settings(settings))
         self._farewell = FarewellHangupWatch(
             enabled=bool(settings.stella_farewell_hangup),
             delay_s=settings.stella_farewell_hangup_s,

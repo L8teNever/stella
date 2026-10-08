@@ -51,13 +51,16 @@ class Settings(BaseSettings):
     stella_client_vad_min_speech_ms: int = 60
     stella_client_vad_rms: int = 500
     # Reject steady engine/road rumble without adding end-of-speech delay.
-    # Speech if RMS >= max(rms, noise*start); end if RMS < max(rms, noise*end)
-    # for silence_ms (same hang as before). clear_rms: unmodulated but clearly voice.
+    # High-pass energy + floor vs stationary frames. Hang stays silence_ms.
+    # clear_rms is unused (kept so old env files still load); it must not bypass.
     stella_client_vad_noise_adapt: bool = True
-    stella_client_vad_start_over_noise: float = 2.0
-    stella_client_vad_end_over_noise: float = 1.35
-    stella_client_vad_clear_rms: int = 3500
-    stella_client_vad_onset_spread: float = 0.3
+    stella_client_vad_start_over_noise: float = 1.8
+    stella_client_vad_end_over_noise: float = 1.15
+    stella_client_vad_clear_rms: int = 0
+    stella_client_vad_onset_spread: float = 0.25
+    stella_client_vad_highpass: bool = True
+    stella_client_vad_rumble_hp_ratio: float = 0.10
+    stella_client_vad_noise_alpha_up: float = 0.25
     stella_latency_log: bool = False
     # Backup hangup if spoken transcript is a farewell and user stays quiet.
     stella_farewell_hangup: bool = True

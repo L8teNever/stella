@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 
 import httpx
@@ -1041,13 +1042,57 @@ def _pcm16_frame(amplitude: int, frames: int = 1) -> bytes:
     return pack_pcm16le([amplitude] * (320 * frames))
 
 
+def _pcm16_tone(freq_hz: float, amplitude: int, frames: int = 1, t0: int = 0) -> tuple[bytes, int]:
+    from stella.audio_pcmu import pack_pcm16le
+
+    n = 320 * frames
+    rate = 16000
+    samples = [
+        int(max(-32767, min(32767, amplitude * math.sin(2 * math.pi * freq_hz * (t0 + i) / rate))))
+        for i in range(n)
+    ]
+    return pack_pcm16le(samples), t0 + n
+
+
+def _pcm16_mix(partials: list[tuple[float, int]], frames: int = 1, t0: int = 0) -> tuple[bytes, int]:
+    from stella.audio_pcmu import pack_pcm16le
+
+    n = 320 * frames
+    rate = 16000
+    samples = []
+    for i in range(n):
+        t = (t0 + i) / rate
+        v = sum(amp * math.sin(2 * math.pi * freq * t) for freq, amp in partials)
+        samples.append(int(max(-32767, min(32767, v))))
+    return pack_pcm16le(samples), t0 + n
+
+
+_SPEECH_AMPS = (9000, 15000, 7000, 12000)
+
+
+def _speech_frames(n: int, t0: int = 0, freq: float = 1000.0) -> tuple[bytes, int]:
+    buf = b""
+    t = t0
+    for i in range(n):
+        chunk, t = _pcm16_tone(freq, _SPEECH_AMPS[i % len(_SPEECH_AMPS)], 1, t)
+        buf += chunk
+    return buf, t
+
+
+def _rumble_frame(t0: int = 0, amplitude: int = 16000) -> tuple[bytes, int]:
+    """Loud LF motor-like energy (same or louder full-band RMS as speech)."""
+    return _pcm16_mix([(75.0, amplitude), (110.0, amplitude // 2), (140.0, amplitude // 3)], 1, t0)
+
+
 def test_energy_vad_emits_start_then_end_after_silence():
     from stella.energy_vad import EnergyVad, EnergyVadConfig
 
     vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=80))
     events: list[str] = []
+    t = 0
     for _ in range(4):
-        events.extend(vad.feed(_pcm16_frame(8000)))
+        frame, t = _speech_frames(1, t)
+        events.extend(vad.feed(frame))
     assert events == ["start"]
     events = []
     for _ in range(5):
@@ -1060,11 +1105,15 @@ def test_energy_vad_quiet_barge_in_still_min_speech_ms():
 
     vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=120))
     events: list[str] = []
-    events.extend(vad.feed(_pcm16_frame(8000)))  # 20 ms
+    t = 0
+    frame, t = _speech_frames(1, t)
+    events.extend(vad.feed(frame))  # 20 ms
     assert events == []
-    events.extend(vad.feed(_pcm16_frame(8000)))  # 40 ms
+    frame, t = _speech_frames(1, t)
+    events.extend(vad.feed(frame))  # 40 ms
     assert events == []
-    events.extend(vad.feed(_pcm16_frame(8000)))  # 60 ms
+    frame, t = _speech_frames(1, t)
+    events.extend(vad.feed(frame))  # 60 ms
     assert events == ["start"]
 
 
@@ -1076,8 +1125,9 @@ def test_energy_vad_quiet_end_latency_matches_silence_ms():
     vad = EnergyVad(
         EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
     )
-    for _ in range(4):
-        vad.feed(_pcm16_frame(8000))
+    t = 0
+    buf, t = _speech_frames(4, t)
+    vad.feed(buf)
     assert vad.speaking
     frames = silence_ms // 20
     events: list[str] = []
@@ -1094,9 +1144,23 @@ def test_energy_vad_ignores_steady_engine_noise():
 
     vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=120))
     events: list[str] = []
+    t = 0
     for _ in range(80):
-        events.extend(vad.feed(_pcm16_frame(1500)))
+        frame, t = _rumble_frame(t, amplitude=16000)
+        events.extend(vad.feed(frame))
     assert events == []
+    assert not vad.speaking
+
+
+def test_energy_vad_loud_rumble_never_holds_speech_open():
+    """Cabin as loud as (or louder than) speech must not look like an open turn."""
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    vad = EnergyVad(EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=120))
+    t = 0
+    for _ in range(50):
+        frame, t = _rumble_frame(t, amplitude=20000)
+        assert vad.feed(frame) == []
     assert not vad.speaking
 
 
@@ -1108,17 +1172,71 @@ def test_energy_vad_ends_turn_on_engine_after_speech():
     vad = EnergyVad(
         EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
     )
+    t = 0
     for _ in range(40):
-        assert vad.feed(_pcm16_frame(1500)) == []
+        frame, t = _rumble_frame(t, amplitude=16000)
+        assert vad.feed(frame) == []
     events: list[str] = []
     for _ in range(4):
-        events.extend(vad.feed(_pcm16_frame(9000)))
+        frame, t = _speech_frames(1, t)
+        events.extend(vad.feed(frame))
     assert events == ["start"]
     events = []
     frames = silence_ms // 20
     for i in range(frames):
-        events.extend(vad.feed(_pcm16_frame(1500)))
+        frame, t = _rumble_frame(t, amplitude=16000)
+        events.extend(vad.feed(frame))
         if i < frames - 1:
+            assert events == []
+    assert events == ["end"]
+
+
+def test_energy_vad_speech_over_cabin_releases_when_talking_stops():
+    """Talking over a loud motor, then only the motor: end in silence_ms."""
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    silence_ms = 120
+    vad = EnergyVad(
+        EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
+    )
+    t = 0
+    for _ in range(30):
+        frame, t = _rumble_frame(t, amplitude=16000)
+        vad.feed(frame)
+    events: list[str] = []
+    for i in range(4):
+        amp = _SPEECH_AMPS[i % len(_SPEECH_AMPS)]
+        frame, t = _pcm16_mix(
+            [(75.0, 16000), (110.0, 8000), (1000.0, amp)], 1, t
+        )
+        events.extend(vad.feed(frame))
+    assert events == ["start"]
+    events = []
+    n = silence_ms // 20
+    for i in range(n):
+        frame, t = _rumble_frame(t, amplitude=16000)
+        events.extend(vad.feed(frame))
+        if i < n - 1:
+            assert events == []
+    assert events == ["end"]
+
+
+def test_energy_vad_speech_then_loud_rumble_ends_in_silence_ms():
+    from stella.energy_vad import EnergyVad, EnergyVadConfig
+
+    silence_ms = 120
+    vad = EnergyVad(
+        EnergyVadConfig(rms_threshold=500, min_speech_ms=60, silence_ms=silence_ms)
+    )
+    t = 0
+    buf, t = _speech_frames(4, t)
+    assert "start" in vad.feed(buf)
+    events: list[str] = []
+    n = silence_ms // 20
+    for i in range(n):
+        frame, t = _rumble_frame(t, amplitude=18000)
+        events.extend(vad.feed(frame))
+        if i < n - 1:
             assert events == []
     assert events == ["end"]
 
@@ -1170,7 +1288,8 @@ async def test_gemini_client_vad_sends_activity_end(tmp_path):
             self.sent.append(json.loads(data) if isinstance(data, str) else data)
 
     session._gemini_ws = DummyGemini()
-    await session._forward_inbound_pcm(_pcm16_frame(9000, 2))
+    speech, _ = _speech_frames(2, 0)
+    await session._forward_inbound_pcm(speech)
     await session._forward_inbound_pcm(_pcm16_frame(0, 4))
     kinds = []
     for msg in session._gemini_ws.sent:

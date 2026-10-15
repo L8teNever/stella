@@ -38,11 +38,12 @@ from stella.gemini_voice import (
 )
 from stella.voice import (
     KICKOFF_TEXT,
-    OWNER_KICKOFF_TEXT,
-    OWNER_OPENING,
+    OWNER_KICKOFF_INBOUND,
+    OWNER_KICKOFF_OUTBOUND,
     TelnyxMediaGuard,
     build_instructions,
     job_wants_german,
+    owner_kickoff_text,
     start_voice_bridge,
 )
 from stella.webhooks import verify_telnyx_signature
@@ -1652,7 +1653,7 @@ def _kickoff_text(sent: list) -> str:
 
 @pytest.mark.asyncio
 async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
-    """Simon hears the exact opening and Jarvis tone even when frag_ida is off."""
+    """Simon gets a short Jarvis line, never a self-introduction, even without frag_ida."""
     owner = "+4917612345678"
     settings = ida_settings(tmp_path, stella_owner_number=owner)
     store = JobStore(settings.stella_db_path)
@@ -1665,18 +1666,27 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
         allow_ida=False,
     )
     plain = build_instructions(job)
-    assert OWNER_OPENING not in plain
+    assert "verified by number" not in plain
     owned = build_instructions(job, owner=True)
     assert owned.startswith(
         "The person on the line is Simon (owner, verified by number)."
     )
-    assert f'Your very first sentence must be exactly: "{OWNER_OPENING}"' in owned
+    assert "must be exactly" not in owned
+    assert "Hallo Simon, hier ist Stella." not in owned
+    assert 'Never say "hier ist Stella".' in owned
+    assert "Never say your name." in owned
+    assert "Never introduce yourself." in owned
     assert "Never ask who is speaking." in owned
+    assert "Ja, Simon?" in owned
+    assert "Simon, was kann ich tun?" in owned
+    assert "Simon, kurz wegen" in owned
     assert "Ich hab schon" in owned
     assert "Ida's phone persona, warm German, female, du-form" in owned
-    assert "Was kann ich für dich tun?" in owned
     assert "Erinner ihn an den Termin" in owned
     assert "hang_up" in owned
+    assert owner_kickoff_text(job) == OWNER_KICKOFF_OUTBOUND
+    briefing = store.create(kind="briefing", to_number=owner, brief="Kurzes Briefing.")
+    assert owner_kickoff_text(briefing) == OWNER_KICKOFF_OUTBOUND
 
     sess = GeminiVoiceSession(
         settings=settings, job=job, gemini_connect=None,
@@ -1685,7 +1695,7 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
     assert sess._owner is True
     assert sess._ask_ida is False
     text = sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
-    assert f'exactly: "{OWNER_OPENING}"' in text
+    assert 'Never say "hier ist Stella".' in text
     assert "frag_ida" not in text
     names = [d["name"] for t in sess._setup_payload()["tools"] for d in t["functionDeclarations"]]
     assert names == ["hang_up"]
@@ -1694,8 +1704,11 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
     sess._gemini_ws = ws
     sess._setup_complete.set()
     await sess._send_kickoff()
-    assert _kickoff_text(ws.sent) == OWNER_KICKOFF_TEXT
-    assert OWNER_OPENING in OWNER_KICKOFF_TEXT
+    kick = _kickoff_text(ws.sent)
+    assert kick == OWNER_KICKOFF_OUTBOUND
+    assert "Simon, kurz wegen" in kick
+    assert "hier ist Stella" in kick  # the ban, not an instruction to say it
+    assert "must be exactly" not in kick
 
     inbound = store.create(kind="inbound", to_number=owner, brief="Simon ruft an.", allow_ida=True)
     in_sess = GeminiVoiceSession(
@@ -1704,7 +1717,15 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
     )
     assert in_sess._owner is True and in_sess._ask_ida is True
     in_text = in_sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
-    assert OWNER_OPENING in in_text and "frag_ida" in in_text
+    assert "Ja, Simon?" in in_text and "frag_ida" in in_text
+    in_ws = FakeProviderWS()
+    in_sess._gemini_ws = in_ws
+    in_sess._setup_complete.set()
+    await in_sess._send_kickoff()
+    in_kick = _kickoff_text(in_ws.sent)
+    assert in_kick == OWNER_KICKOFF_INBOUND
+    assert "Ja, Simon?" in in_kick and "Simon, was kann ich tun?" in in_kick
+    assert "kurz wegen" not in in_kick
 
     other = store.create(kind="call", to_number="+14155552671", brief="Book a table.", allow_ida=True)
     other_sess = GeminiVoiceSession(
@@ -1712,7 +1733,7 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
         hangup_cb=lambda: None, transcript_cb=lambda c: None, outcome_cb=lambda t: None,
     )
     assert other_sess._owner is False
-    assert OWNER_OPENING not in other_sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
+    assert "verified by number" not in other_sess._setup_payload()["systemInstruction"]["parts"][0]["text"]
     ws2 = FakeProviderWS()
     other_sess._gemini_ws = ws2
     other_sess._setup_complete.set()

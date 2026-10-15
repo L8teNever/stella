@@ -199,22 +199,40 @@ def job_wants_german(job: CallJob) -> bool:
 
 KICKOFF_TEXT = "They answered. Start from the brief now."
 
-# Spoken opening when the party on the line is Simon (STELLA_OWNER_NUMBER).
-OWNER_OPENING = "Hallo Simon, hier ist Stella."
+# Simon already knows the voice. Never a fixed self-introduction on owner calls.
+_OWNER_OPEN_BAN = (
+    'Never say your name. Never say "hier ist Stella". '
+    "Never introduce yourself. Never ask who is speaking."
+)
 
 OWNER_INSTRUCTIONS = f"""\
-The person on the line is Simon (owner, verified by number). Your very first sentence must be exactly: "{OWNER_OPENING}" Never ask who is speaking. You may follow that opening with one short Jarvis-style line only if it is natural, for example "Was kann ich für dich tun?".
+The person on the line is Simon (owner, verified by number). He already knows it is you. {_OWNER_OPEN_BAN}
+
+Open with one very short, natural Jarvis-style line that addresses Simon. Vary it slightly from call to call. If he called you (inbound), examples: "Ja, Simon?" / "Simon, was kann ich tun?". If you called him (outbound), get straight to the reason in the brief, for example "Simon, kurz wegen ...". Do not add a self-introduction before that line.
 
 With Simon, inbound and outbound, you have a Jarvis vibe: composed, confident, concise, a touch of dry elegance and quiet wit, anticipatory ("Ich hab schon..."), always loyal and calm, while staying Stella (Ida's phone persona, warm German, female, du-form).
 """
 
-OWNER_KICKOFF_TEXT = (
-    "The call is live. Simon (the owner, verified by number) is on the line. "
-    f'Speak now. Your very first sentence must be exactly: "{OWNER_OPENING}" '
-    "Never ask who is speaking. Then continue from the brief. "
-    'You may add one short Jarvis-style line after that sentence only if it is natural, '
-    'for example "Was kann ich für dich tun?".'
+OWNER_KICKOFF_INBOUND = (
+    "The call is live. Simon (the owner, verified by number) called. Speak now. "
+    "Open with one very short, natural Jarvis-style line that addresses him. Vary it. "
+    'Examples: "Ja, Simon?" / "Simon, was kann ich tun?". '
+    f"{_OWNER_OPEN_BAN} Then continue from the brief."
 )
+
+OWNER_KICKOFF_OUTBOUND = (
+    "The call is live. Simon (the owner, verified by number) is on the line. Speak now. "
+    "Get straight to the reason in the brief. "
+    'Open with one very short Jarvis-style line such as "Simon, kurz wegen ...". '
+    f"Vary the wording. Address him. {_OWNER_OPEN_BAN}"
+)
+
+
+def owner_kickoff_text(job: CallJob) -> str:
+    """Kickoff for an owner call. Inbound greets; outbound goes straight to the brief."""
+    if (job.kind or "").strip().lower() == "inbound":
+        return OWNER_KICKOFF_INBOUND
+    return OWNER_KICKOFF_OUTBOUND
 
 
 def is_owner_call(settings: Settings, to_number: str) -> bool:

@@ -23,12 +23,12 @@ from stella.energy_vad import EnergyVad, energy_vad_config_from_settings, pcm_rm
 from stella.store import CallJob
 from stella.voice import (
     KICKOFF_TEXT,
-    OWNER_KICKOFF_TEXT,
     FarewellHangupWatch,
     TelnyxMediaGuard,
     build_instructions,
     hang_up_tool_openai,
     is_owner_call,
+    owner_kickoff_text,
     parse_hang_up_args,
 )
 
@@ -434,7 +434,7 @@ class GeminiVoiceSession:
         await self._setup_complete.wait()
         if self._closed or self._gemini_ws is None:
             return
-        kickoff = OWNER_KICKOFF_TEXT if self._owner else KICKOFF_TEXT
+        kickoff = owner_kickoff_text(self.job) if self._owner else KICKOFF_TEXT
         await self._gemini_ws.send(
             json.dumps(
                 {

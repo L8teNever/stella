@@ -23,10 +23,12 @@ from stella.energy_vad import EnergyVad, energy_vad_config_from_settings, pcm_rm
 from stella.store import CallJob
 from stella.voice import (
     KICKOFF_TEXT,
+    OWNER_KICKOFF_TEXT,
     FarewellHangupWatch,
     TelnyxMediaGuard,
     build_instructions,
     hang_up_tool_openai,
+    is_owner_call,
     parse_hang_up_args,
 )
 
@@ -299,6 +301,8 @@ class GeminiVoiceSession:
         self._logged_setup_audio = False
         self._logged_turn_audio = False
         self._active_model = gemini_model_id(settings)
+        # Greeting and Jarvis tone follow the owner number alone, not frag_ida.
+        self._owner = is_owner_call(settings, job.to_number)
         # frag_ida only on calls to the owner number (re-checked here, not just at dial).
         self._ask_ida = bool(job.allow_ida) and ida_allowed_for(settings, job.to_number)
         self._ida_task: asyncio.Task | None = None
@@ -398,7 +402,14 @@ class GeminiVoiceSession:
             "model": gemini_model_name(self.settings, model),
             "generationConfig": gemini_generation_config(self.settings, model),
             "systemInstruction": {
-                "parts": [{"text": build_instructions(self.job, ask_ida=self._ask_ida, callback=bool(self._schedule_cb))}]
+                "parts": [{
+                    "text": build_instructions(
+                        self.job,
+                        ask_ida=self._ask_ida,
+                        callback=bool(self._schedule_cb),
+                        owner=self._owner,
+                    )
+                }]
             },
             "tools": gemini_tools(ask_ida=self._ask_ida, callback=bool(self._schedule_cb)),
             "outputAudioTranscription": {},
@@ -423,6 +434,7 @@ class GeminiVoiceSession:
         await self._setup_complete.wait()
         if self._closed or self._gemini_ws is None:
             return
+        kickoff = OWNER_KICKOFF_TEXT if self._owner else KICKOFF_TEXT
         await self._gemini_ws.send(
             json.dumps(
                 {
@@ -430,7 +442,7 @@ class GeminiVoiceSession:
                         "turns": [
                             {
                                 "role": "user",
-                                "parts": [{"text": KICKOFF_TEXT}],
+                                "parts": [{"text": kickoff}],
                             }
                         ],
                         "turnComplete": True,

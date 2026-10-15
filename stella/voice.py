@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from stella import master_prompt
 from stella.config import Settings
+from stella.errors import StellaError, normalize_e164
 from stella.store import CallJob
 
 logger = logging.getLogger(__name__)
@@ -198,6 +199,39 @@ def job_wants_german(job: CallJob) -> bool:
 
 KICKOFF_TEXT = "They answered. Start from the brief now."
 
+# Spoken opening when the party on the line is Simon (STELLA_OWNER_NUMBER).
+OWNER_OPENING = "Hallo Simon, hier ist Stella."
+
+OWNER_INSTRUCTIONS = f"""\
+The person on the line is Simon (owner, verified by number). Your very first sentence must be exactly: "{OWNER_OPENING}" Never ask who is speaking. You may follow that opening with one short Jarvis-style line only if it is natural, for example "Was kann ich für dich tun?".
+
+With Simon, inbound and outbound, you have a Jarvis vibe: composed, confident, concise, a touch of dry elegance and quiet wit, anticipatory ("Ich hab schon..."), always loyal and calm, while staying Stella (Ida's phone persona, warm German, female, du-form).
+"""
+
+OWNER_KICKOFF_TEXT = (
+    "The call is live. Simon (the owner, verified by number) is on the line. "
+    f'Speak now. Your very first sentence must be exactly: "{OWNER_OPENING}" '
+    "Never ask who is speaking. Then continue from the brief. "
+    'You may add one short Jarvis-style line after that sentence only if it is natural, '
+    'for example "Was kann ich für dich tun?".'
+)
+
+
+def is_owner_call(settings: Settings, to_number: str) -> bool:
+    """True when the party on the line is STELLA_OWNER_NUMBER.
+
+    Inbound stores the caller in ``to_number``, outbound stores the destination.
+    This is independent of ``ida_allowed_for`` / ``frag_ida``.
+    """
+    owner = (settings.stella_owner_number or "").strip()
+    number = (to_number or "").strip()
+    if not owner or not number:
+        return False
+    try:
+        return normalize_e164(number) == normalize_e164(owner)
+    except StellaError:
+        return False
+
 
 ASK_IDA_INSTRUCTIONS = """
 Tool frag_ida: You are talking to Simon himself and, through frag_ida, you can reach all
@@ -258,7 +292,9 @@ confirmation. Then continue normally or say goodbye and call hang_up.
 """
 
 
-def build_instructions(job: CallJob, *, ask_ida: bool = False, callback: bool = False) -> str:
+def build_instructions(
+    job: CallJob, *, ask_ida: bool = False, callback: bool = False, owner: bool = False
+) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
     lang = ""
     if job_wants_german(job):
@@ -280,7 +316,7 @@ def build_instructions(job: CallJob, *, ask_ida: bool = False, callback: bool = 
         if master
         else STYLE_DEFAULT
     )
-    return (
+    body = (
         f"{STELLA_SYSTEM}\n\n"
         f"{style}\n\n"
         f"{speak}"
@@ -290,6 +326,9 @@ def build_instructions(job: CallJob, *, ask_ida: bool = False, callback: bool = 
         f"Extra context from the dispatcher (this is all you have):\n{ctx}\n"
         f"{ida}"
     )
+    if owner:
+        return f"{OWNER_INSTRUCTIONS.strip()}\n\n{body}"
+    return body
 
 
 def hang_up_tool_openai() -> dict[str, Any]:

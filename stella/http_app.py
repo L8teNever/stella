@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from stella import __version__, callback_bg, master_prompt
 from stella.config import Settings, get_settings
 from stella.errors import StellaError
-from stella import callback_bg, master_prompt
 from stella.jobs import BERLIN, JobService
 from stella.mcp_app import build_mcp
 from stella.store import JobStore
@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             mp_task.cancel()
 
-    app = FastAPI(title="Stella", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Stella", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.store = store
     app.state.jobs = jobs

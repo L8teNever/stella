@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,6 +117,9 @@ class JobStore:
                 )
                 """
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)"
+            )
             conn.commit()
 
     def create(
@@ -184,6 +188,37 @@ class JobStore:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row else None
+
+    def list_by_status(self, statuses: Collection[str]) -> list[dict[str, str]]:
+        """Active-job columns only. Lock covers the SELECT and is released before return.
+
+        Read-only connection: this cannot write, and it does not load brief or transcript.
+        """
+        keys = tuple(dict.fromkeys(statuses))
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        sql = (
+            "SELECT id, kind, status, to_number, created_at FROM jobs "
+            f"WHERE status IN ({placeholders}) ORDER BY created_at ASC, id ASC"
+        )
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("PRAGMA query_only = ON")
+                rows = conn.execute(sql, keys).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "id": row["id"],
+                "kind": row["kind"],
+                "status": row["status"],
+                "to_number": row["to_number"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def list_recent(self, limit: int = 10, kind: str | None = None) -> list[CallJob]:
         limit = max(1, min(int(limit), 50))

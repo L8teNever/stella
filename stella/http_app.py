@@ -112,6 +112,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         jobs.handle_telnyx_event(body)
         return {"received": True}
 
+    @app.get("/status/busy")
+    def status_busy():
+        """Same snapshot as MCP `stella_busy`. Read-only; does not dial or wait."""
+        return jobs.busy()
+
     @app.get("/calls/{call_id}")
     def get_call(call_id: str):
         try:
@@ -180,7 +185,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.middleware("http")
     async def admin_auth_middleware(request: Request, call_next):
         path = (request.scope.get("path") or "").lower()
-        needs = path.startswith("/mcp") or path.startswith("/calls")
+        needs = (
+            path.startswith("/mcp")
+            or path.startswith("/calls")
+            or path.startswith("/status")
+        )
         if needs and settings.stella_mcp_token and not _token_ok(request, settings.stella_mcp_token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)

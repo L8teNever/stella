@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stella.errors import StellaError
 from stella.jobs import JobService
@@ -14,7 +15,9 @@ def build_mcp(service: JobService) -> FastMCP:
         instructions=(
             "Stella places outbound phone calls and automatically answers inbound "
             "PSTN to TELNYX_FROM_NUMBER (owner by default). Use stella_call for "
-            "outbound; inbound needs no MCP. Pass everything the agent needs in "
+            "outbound; inbound needs no MCP. stella_busy is a cheap read-only poll "
+            "for whether a call is already in progress; it does not dial or wait. "
+            "Pass everything the agent needs in "
             "brief/context. Stella has no direct access to Ida memory or other MCPs; only calls"
             " with the owner on the line may use the live `frag_ida` lookup."
         ),
@@ -61,6 +64,16 @@ def build_mcp(service: JobService) -> FastMCP:
             return data
         except StellaError as exc:
             return exc.to_dict()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    def stella_busy() -> dict[str, Any]:
+        """Read-only: is Stella on a call right now? Safe to poll often. Does not dial or wait.
+
+        `busy` is true while any inbound or outbound job is queued, dialing, ringing
+        (`initiated`), in progress, completing, or rejecting. Returns `count` and
+        `calls` (id, direction, status, started_at, to, from). No brief or transcript.
+        """
+        return service.busy()
 
     @mcp.tool()
     def stella_recent_calls(limit: int = 10, kind: str = "") -> dict[str, Any]:

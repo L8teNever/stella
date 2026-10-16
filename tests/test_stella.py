@@ -221,6 +221,7 @@ def test_mcp_tools_registered(tmp_path):
         "stella_call_status",
         "stella_briefing_call",
         "stella_recent_calls",
+        "stella_busy",
     }
 
 
@@ -1477,6 +1478,112 @@ def test_mcp_token_protects_mcp_and_calls(tmp_path):
     assert client.get("/calls/x?Token=wrong").status_code == 401
     assert client.get("/calls/x?Token=s3cret").status_code == 404
     assert client.get("/calls/x", headers={"Authorization": "Bearer s3cret"}).status_code == 404
+    assert client.get("/status/busy").status_code == 401
+    assert client.get("/status/busy?Token=wrong").status_code == 401
+    ok = client.get("/status/busy", headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200
+    assert ok.json() == {"busy": False, "count": 0, "calls": []}
+    assert client.get("/status/busy?Token=s3cret").json()["busy"] is False
+
+
+def test_stella_busy_snapshot_is_readonly(tmp_path):
+    import threading
+
+    from stella.jobs import BUSY_STATUSES
+
+    settings = make_settings(tmp_path)
+    transport = FakeTransport()
+    store = JobStore(settings.stella_db_path)
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    mcp = build_mcp(svc)
+    tool = next(t for t in mcp._tool_manager.list_tools() if t.name == "stella_busy")
+    assert tool.annotations is not None and tool.annotations.readOnlyHint is True
+
+    assert svc.busy() == {"busy": False, "count": 0, "calls": []}
+    assert tool.fn() == svc.busy()
+    assert transport.calls == []
+
+    outbound = store.create(kind="call", to_number="+14155552671", brief="Book a table. " * 50)
+    store.update(outbound.id, status="dialing")
+    inbound = store.create(kind="inbound", to_number="+4917612345678", brief="Simon ruft an.")
+    store.update(inbound.id, status="in_progress")
+    briefing = store.create(kind="briefing", to_number="+14155550002", brief="Morning note.")
+    store.update(briefing.id, status="queued")
+    for status, number in (
+        ("completed", "+14155550000"),
+        ("failed", "+14155550001"),
+        ("rejected", "+19995550000"),
+    ):
+        done = store.create(kind="call", to_number=number, brief="finished")
+        store.update(done.id, status=status)
+
+    snap = svc.busy()
+    assert snap["busy"] is True
+    assert snap["count"] == 3
+    by_id = {c["id"]: c for c in snap["calls"]}
+    assert set(by_id) == {outbound.id, inbound.id, briefing.id}
+    assert by_id[outbound.id] == {
+        "id": outbound.id,
+        "direction": "outbound",
+        "status": "dialing",
+        "started_at": outbound.created_at,
+        "to": "+14155552671",
+        "from": settings.telnyx_from_number,
+    }
+    assert "brief" not in by_id[outbound.id] and "transcript" not in by_id[outbound.id]
+    assert by_id[inbound.id]["direction"] == "inbound"
+    assert by_id[inbound.id]["from"] == "+4917612345678"
+    assert by_id[inbound.id]["to"] == settings.telnyx_from_number
+    assert by_id[briefing.id]["direction"] == "outbound"
+    assert by_id[briefing.id]["status"] == "queued"
+    assert tool.fn() == snap
+    assert transport.calls == []
+
+    for status in ("initiated", "completing", "rejecting", "in_progress"):
+        store.update(outbound.id, status=status)
+        again = svc.busy()
+        assert again["count"] == 3
+        assert any(c["id"] == outbound.id and c["status"] == status for c in again["calls"])
+    assert BUSY_STATUSES == {
+        "queued", "dialing", "initiated", "in_progress", "completing", "rejecting",
+    }
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(settings))
+    # create_app opens its own store on the same db path.
+    body = client.get("/status/busy").json()
+    assert body["busy"] is True
+    assert body["count"] == 3
+    assert {c["id"] for c in body["calls"]} == {outbound.id, inbound.id, briefing.id}
+
+    errors: list[BaseException] = []
+
+    def poll() -> None:
+        try:
+            for _ in range(20):
+                view = svc.busy()
+                assert isinstance(view["busy"], bool)
+                assert view["count"] == len(view["calls"])
+        except BaseException as exc:
+            errors.append(exc)
+
+    def write() -> None:
+        try:
+            for i in range(20):
+                job = store.create(kind="call", to_number=f"+1415555{i:04d}", brief="x")
+                store.update(job.id, status="completed" if i % 2 else "dialing")
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=poll) for _ in range(4)]
+    threads.append(threading.Thread(target=write))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert transport.calls == []
 
 
 # --- frag_ida (Claude Code as thinker) ---------------------------------------

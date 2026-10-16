@@ -42,7 +42,7 @@ See `.env.example`. Required for a real outbound call:
 | `STELLA_PUBLIC_BASE_URL` | Public HTTPS origin Telnyx can hit |
 | `GEMINI_API_KEY` | Gemini Live (voice provider) |
 
-Optional: `STELLA_CALLBACK_URL` (POST JSON when a call hangs up), `STELLA_MCP_TOKEN` (Bearer for `/mcp`).
+Optional: `STELLA_CALLBACK_URL` (POST JSON when a call hangs up), `STELLA_MCP_TOKEN` (Bearer for `/mcp`, `/calls`, and `/status/busy`).
 
 `STELLA_SKIP_WEBHOOK_VERIFY=true` is **only** for local tests without Telnyx signatures. Do not use it in any shared environment.
 
@@ -121,7 +121,7 @@ Stella serves Streamable HTTP MCP at:
 
 `http://localhost:8080/mcp`
 
-If `STELLA_MCP_TOKEN` is set, send `Authorization: Bearer <token>`.
+If `STELLA_MCP_TOKEN` is set, send `Authorization: Bearer <token>` (same token for `GET /status/busy`).
 
 Cursor `mcp.json` example:
 
@@ -166,6 +166,29 @@ Or locally after `pip install -e .`: `stella mcp` / `stella-mcp`.
 **`stella_recent_calls`** — last jobs (`limit`, optional `kind`: `call` / `briefing` / `inbound`). Inbound appears here when someone dials Stella.
 
 **`stella_briefing_call`** — `to` + `text` to read aloud (morning briefing), then hang up.
+
+**`stella_busy`** — read-only, no arguments. Safe to poll often while other agents call `stella_call`. One indexed SQLite read of jobs that are still on the line (`queued`, `dialing`, `initiated` / ringing, `in_progress`, `completing`, `rejecting`), inbound or outbound. It does not dial, hang up, or load briefs and transcripts. A job stays busy until it reaches `completed`, `failed`, or `rejected`.
+
+```json
+{"busy": false, "count": 0, "calls": []}
+```
+
+When Stella is in use, `calls` is a short list: `id`, `direction` (`inbound` or `outbound`), `status`, `started_at`, `to`, `from`.
+
+The same snapshot is `GET /status/busy` (Bearer or `?Token=` when `STELLA_MCP_TOKEN` is set; `/health` stays open).
+
+```python
+import json
+import urllib.request
+
+req = urllib.request.Request(
+    "http://localhost:8080/status/busy",
+    headers={"Authorization": "Bearer YOUR_TOKEN"},
+)
+with urllib.request.urlopen(req, timeout=2) as resp:
+    body = json.load(resp)
+print(body["busy"], body["count"])
+```
 
 ### Example jobs
 

@@ -22,6 +22,16 @@ BERLIN = ZoneInfo("Europe/Berlin")
 MAX_SCHEDULE_AHEAD = timedelta(days=14)
 _HHMM = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:uhr)?\s*$", re.IGNORECASE)
 INBOUND_UNKNOWN_MODES = frozenset({"hangup", "speak", "answer"})
+# Line is in use until a terminal status. `queued` covers the Telnyx dial itself
+# (status stays queued until the dial HTTP returns). `initiated` is ringing.
+BUSY_STATUSES = frozenset({
+    "queued",
+    "dialing",
+    "initiated",
+    "in_progress",
+    "completing",
+    "rejecting",
+})
 DEFAULT_INBOUND_BRIEF = (
     "Du bist Stella. Simon ruft an — führe ein normales kurzes Gespräch auf Deutsch."
 )
@@ -156,6 +166,25 @@ class JobService:
         if not job:
             raise StellaError(f"Unknown call id: {call_id}", "not_found")
         return job
+
+    def busy(self) -> dict[str, Any]:
+        """Whether any call is on the line. One indexed read; no Telnyx, no waiting."""
+        our = (self.settings.telnyx_from_number or "").strip()
+        calls = []
+        for row in self.store.list_by_status(BUSY_STATUSES):
+            inbound = row["kind"] == "inbound"
+            # Inbound stores the caller in to_number; outbound stores the destination.
+            calls.append(
+                {
+                    "id": row["id"],
+                    "direction": "inbound" if inbound else "outbound",
+                    "status": row["status"],
+                    "started_at": row["created_at"],
+                    "to": our if inbound else row["to_number"],
+                    "from": row["to_number"] if inbound else our,
+                }
+            )
+        return {"busy": bool(calls), "count": len(calls), "calls": calls}
 
     def handle_telnyx_event(self, body: dict[str, Any]) -> None:
         data = body.get("data") or body

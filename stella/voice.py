@@ -288,6 +288,16 @@ same question and bestaetigt=true. Never set bestaetigt=true without his explici
 Not for general knowledge: answer those yourself or say you don't know.
 """
 
+MCP_DIRECT_INSTRUCTIONS = """
+Direct tools: for a simple lookup or one clear action, prefer the matching tool below
+over frag_ida. Say one short filler such as "Moment." and call that tool in the same turn.
+Pass only the arguments it asks for. Do not tell Simon the tool name. Do not invent a result.
+If the tool errors, times out, or comes back empty, say so briefly or call frag_ida.
+Use frag_ida when the request needs reasoning, several sources, or no direct tool fits.
+Available direct tools:
+{catalog}
+"""
+
 
 CALLBACK_INSTRUCTIONS = """
 Later tasks: it is now {now} (Europe/Berlin). Whenever Simon wants something to happen later
@@ -311,7 +321,12 @@ confirmation. Then continue normally or say goodbye and call hang_up.
 
 
 def build_instructions(
-    job: CallJob, *, ask_ida: bool = False, callback: bool = False, owner: bool = False
+    job: CallJob,
+    *,
+    ask_ida: bool = False,
+    callback: bool = False,
+    owner: bool = False,
+    mcp_tools: list[tuple[str, str]] | None = None,
 ) -> str:
     speak = f"You are speaking with: {job.speak_to}.\n" if job.speak_to else ""
     lang = ""
@@ -323,6 +338,10 @@ def build_instructions(
             "Never loop 'ich verstehe nicht' or ask to repeat unless they said nothing.\n"
         )
     ctx = job.context.strip() or "(none provided)"
+    mcp = ""
+    if mcp_tools:
+        catalog = "\n".join(f"- {name}: {desc}" for name, desc in mcp_tools)
+        mcp = MCP_DIRECT_INSTRUCTIONS.format(catalog=catalog)
     ida = ASK_IDA_INSTRUCTIONS if ask_ida else ""
     if ask_ida and callback:
         now = datetime.now(ZoneInfo("Europe/Berlin"))
@@ -342,7 +361,7 @@ def build_instructions(
         f"Job type: {job.kind}\n"
         f"Brief / task:\n{job.brief.strip()}\n\n"
         f"Extra context from the dispatcher (this is all you have):\n{ctx}\n"
-        f"{ida}"
+        f"{mcp}{ida}"
     )
     if owner:
         return f"{OWNER_INSTRUCTIONS.strip()}\n\n{body}"

@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     stella_inbound_unknown_brief: str = (
         "Unbekannter Anrufer. Keine persönlichen Daten. Kurz und höflich, dann auflegen."
     )
+    # Direct MCP tools for Gemini Live on owner calls. JSON list:
+    # [{"name":"calendar","url":"https://…/mcp","token_env":"CALENDAR_MCP_TOKEN","allow":["list_events"]}]
+    # token_env is an env var name, never the token. allow omitted = every tool on that server.
+    stella_mcp_servers: str = ""
+    # Per tool call. The phone session keeps streaming audio while this runs.
+    stella_mcp_tool_timeout_s: float = 8.0
     # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.
     anthropic_api_key: str = ""
     claude_code_oauth_token: str = ""

@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     # After answer, drop barge-in until the first sentence has finished and at
     # least this long has passed. Line noise was cutting the greeting.
     stella_greeting_barge_in_s: float = 2.5
+    # While outbound audio is still playing, activityStart below
+    # factor × STELLA_CLIENT_VAD_RMS is speaker echo, not barge-in.
+    # 0 disables the gate. 3 keeps a close talker and drops handset echo.
+    stella_echo_rms_factor: float = 3.0
 
     # "Frag Ida": Gemini asks Claude Code (claude -p + Ida MCP servers) mid-call.
     ask_ida_enabled: bool = False

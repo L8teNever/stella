@@ -247,7 +247,7 @@ class ServerLink:
             if not self._opened.is_set():
                 self._opened.set()
 
-    async def _serve(self) -> None:
+    async def _serve(self) -> bool:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
 

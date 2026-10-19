@@ -1470,6 +1470,94 @@ async def test_greeting_barge_in_blocked_until_sentence_and_floor(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_echo_does_not_open_a_turn_while_stella_speaks(tmp_path, caplog):
+    """Handset echo during playout must not send activityStart/activityEnd. Loud barge-in still does."""
+    from stella.energy_vad import pcm_rms
+
+    settings = make_settings(
+        tmp_path,
+        gemini_api_key="g-key",
+        stella_client_vad=True,
+        stella_client_vad_min_speech_ms=20,
+        stella_client_vad_silence_ms=40,
+        stella_client_vad_rms=200,
+        stella_client_vad_noise_adapt=False,
+        stella_echo_rms_factor=3,
+    )
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+
+    class DummyGemini:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data) if isinstance(data, str) else data)
+
+    session._gemini_ws = DummyGemini()
+    echo, _ = _pcm16_tone(1000, 800, frames=8)
+    silence = _pcm16_frame(0, 6)
+    assert pcm_rms(echo) < session._echo_start_rms()
+
+    await session._forward_inbound_pcm(echo)
+    await session._forward_inbound_pcm(silence)
+    assert "start" in _activity_kinds(session._gemini_ws.sent)
+    assert "end" in _activity_kinds(session._gemini_ws.sent)
+
+    session._vad.reset()
+    session._user_turn_open = False
+    session._gemini_ws.sent.clear()
+    session.guard._play_end = time.monotonic() + 30
+    with caplog.at_level("INFO"):
+        await session._forward_inbound_pcm(echo + silence)
+    kinds = _activity_kinds(session._gemini_ws.sent)
+    assert "start" not in kinds and "end" not in kinds
+    assert "suppress activity_start" in caplog.text
+    assert "drop activity_end reason=no_user_speech" in caplog.text
+    assert session._user_turn_open is False
+
+    loud, _ = _pcm16_tone(1000, 1000, frames=8)
+    assert pcm_rms(loud) >= session._echo_start_rms()
+    session._gemini_ws.sent.clear()
+    await session._forward_inbound_pcm(loud)
+    await session._forward_inbound_pcm(silence)
+    kinds = _activity_kinds(session._gemini_ws.sent)
+    assert kinds.index("start") < kinds.index("end")
+
+
+@pytest.mark.asyncio
+async def test_input_transcription_is_logged_truncated(tmp_path, caplog):
+    settings = make_settings(tmp_path, gemini_api_key="g-key")
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    tail = "ENDE_NICHT_LOGGEN"
+    text = ("Was steht heute an? " * 12) + tail
+    with caplog.at_level("INFO", logger="stella.gemini_voice"):
+        await session._handle_gemini_event(
+            {"serverContent": {"inputTranscription": {"text": text}}}
+        )
+    assert "stella_input_tx" in caplog.text
+    assert tail not in caplog.text
+    assert "chars=" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_gemini_farewell_hangup_backup(tmp_path):
     settings = make_settings(
         tmp_path,

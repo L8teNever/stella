@@ -35,6 +35,8 @@ from stella.voice import (
 
 logger = logging.getLogger(__name__)
 
+_INPUT_TX_LOG = 80
+
 # https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live
 # Live WebSocket get-started uses this id with responseModalities AUDIO.
 # Confirmed on Simon's key via v1beta listModels (bidiGenerateContent).
@@ -140,6 +142,14 @@ def gemini_generation_config(
         else:
             cfg["thinkingConfig"] = {"thinkingBudget": budget}
     return cfg
+
+
+def _log_input_transcription(text: str) -> None:
+    flat = " ".join((text or "").split())
+    if not flat:
+        return
+    shown = flat if len(flat) <= _INPUT_TX_LOG else flat[:_INPUT_TX_LOG] + "…"
+    logger.info("stella_input_tx chars=%d text=%s", len(flat), shown)
 
 
 def hang_up_tool_gemini() -> dict[str, Any]:
@@ -334,6 +344,9 @@ class GeminiVoiceSession:
         self._greeting_heard = False
         self._greeting_turn_done = False
         self._barge_in_open = False
+        # activityStart was forwarded. activityEnd without this is echo, not a turn.
+        self._user_turn_open = False
+        self._echo_hold = False
 
     def note_answered(self) -> None:
         if self._answered_mono is None:
@@ -569,6 +582,7 @@ class GeminiVoiceSession:
             # Spoken text is outputTranscription only.
         in_piece = (server.get("inputTranscription") or {}).get("text") or ""
         if in_piece:
+            _log_input_transcription(in_piece)
             self._note_dialog(self.job.speak_to or "Anrufer", in_piece)
         out_tx = server.get("outputTranscription") or {}
         piece = out_tx.get("text") or ""
@@ -746,10 +760,24 @@ class GeminiVoiceSession:
             return
         client_vad = gemini_uses_client_vad(self.settings)
         events = self._vad.feed(pcm) if client_vad else []
-        if not client_vad and pcm_rms(pcm) >= self.settings.stella_client_vad_rms:
+        rms = pcm_rms(pcm)
+        if not client_vad and rms >= self.settings.stella_client_vad_rms:
             self._farewell.note_user_speech()
         for ev in events:
             if ev == "start":
+                if self._echo_blocks_start(rms):
+                    # VAD heard the handset. Drop the start so a louder onset can still fire.
+                    self._vad.speaking = False
+                    if not self._echo_hold:
+                        self._echo_hold = True
+                        logger.info(
+                            "stella_echo suppress activity_start rms=%d need=%d",
+                            rms,
+                            self._echo_start_rms(),
+                        )
+                    continue
+                self._echo_hold = False
+                self._user_turn_open = True
                 self._farewell.note_user_speech()
                 await self._gemini_ws.send(json.dumps({"realtimeInput": {"activityStart": {}}}))
         await self._gemini_ws.send(
@@ -766,10 +794,27 @@ class GeminiVoiceSession:
         )
         for ev in events:
             if ev == "end":
+                if not self._user_turn_open:
+                    logger.info("stella_echo drop activity_end reason=no_user_speech")
+                    continue
+                self._user_turn_open = False
                 self._t_activity_end_ms = time.monotonic() * 1000
                 self._logged_turn_audio = False
                 self._latency("activity_end")
                 await self._gemini_ws.send(json.dumps({"realtimeInput": {"activityEnd": {}}}))
+
+    def _echo_start_rms(self) -> int:
+        factor = float(self.settings.stella_echo_rms_factor)
+        if factor <= 0:
+            return 0
+        return max(0, int(self.settings.stella_client_vad_rms * factor))
+
+    def _echo_blocks_start(self, rms: int) -> bool:
+        """True while Stella is still audible and this onset is too quiet to be barge-in."""
+        need = self._echo_start_rms()
+        if need <= 0 or self.guard.remaining_playout_s() <= 0:
+            return False
+        return rms < need
 
     def _note_first_outbound(self) -> None:
         now = time.monotonic() * 1000

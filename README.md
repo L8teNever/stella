@@ -68,6 +68,8 @@ The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5
 
 **Greeting:** For `STELLA_GREETING_BARGE_IN_S` seconds after answer (default 2.5), and until that first sentence has actually finished, Stella drops inbound audio and activity markers. Line noise was sending `activityEnd` several times and `START_OF_ACTIVITY_INTERRUPTS` kept restarting the greeting. Barge-in works as usual after that.
 
+**Echo:** While that outbound audio is still playing (`remaining_playout_s` > 0), an `activityStart` quieter than `STELLA_ECHO_RMS_FACTOR` × `STELLA_CLIENT_VAD_RMS` (default 3 × 500) is the handset, not Simon. Stella does not open a Gemini turn for it, and an `activityEnd` with no accepted user speech is dropped. A loud onset still barges in. Incoming transcription is logged truncated (`stella_input_tx`).
+
 ## Frag Ida (Claude Code im Anruf)
 
 On a call to the **owner number**, Gemini can look up Simon’s personal data (calendar, timetable, homework, mail read-only, smart-home status) via the function tool `frag_ida`:

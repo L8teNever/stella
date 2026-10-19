@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     # Backup hangup if spoken transcript is a farewell and user stays quiet.
     stella_farewell_hangup: bool = True
     stella_farewell_hangup_s: float = 1.5
+    # After answer, drop barge-in until the first sentence has finished and at
+    # least this long has passed. Line noise was cutting the greeting.
+    stella_greeting_barge_in_s: float = 2.5
 
     # "Frag Ida": Gemini asks Claude Code (claude -p + Ida MCP servers) mid-call.
     ask_ida_enabled: bool = False

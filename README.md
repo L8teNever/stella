@@ -66,6 +66,8 @@ The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5
 
 **Hang-up:** The model must call `hang_up` to drop the PSTN leg (spoken “tschüss” is not enough). TelnyxMediaGuard still waits for stream start and outbound playout. A backup fires if the spoken transcript looks like a farewell and inbound stays quiet for `STELLA_FAREWELL_HANGUP_S` (disable with `STELLA_FAREWELL_HANGUP=false`).
 
+**Greeting:** For `STELLA_GREETING_BARGE_IN_S` seconds after answer (default 2.5), and until that first sentence has actually finished, Stella drops inbound audio and activity markers. Line noise was sending `activityEnd` several times and `START_OF_ACTIVITY_INTERRUPTS` kept restarting the greeting. Barge-in works as usual after that.
+
 ## Frag Ida (Claude Code im Anruf)
 
 On a call to the **owner number**, Gemini can look up Simon’s personal data (calendar, timetable, homework, mail read-only, smart-home status) via the function tool `frag_ida`:

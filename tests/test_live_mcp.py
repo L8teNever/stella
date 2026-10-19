@@ -203,9 +203,15 @@ async def test_owner_session_prefers_direct_tools_without_blocking_audio(
         assert names[:3] == ["hang_up", "frag_ida", "fake__echo"]
         assert "fake__geheim" not in names and "geheim" not in names
         text = payload["systemInstruction"]["parts"][0]["text"]
-        assert "prefer the matching tool below" in text
+        assert "Direct tools always come before frag_ida" in text
         assert "fake__echo" in text and "frag_ida" in text
-        assert "Use frag_ida when the request needs reasoning" in text
+        assert "Was steht heute an?" in text
+        assert "google__" in text and "never frag_ida" in text
+        frag = next(
+            d for t in payload["tools"] for d in t["functionDeclarations"] if d["name"] == "frag_ida"
+        )
+        assert "Nur Fallback" in frag["description"]
+        assert "Was steht heute an?" in frag["description"]
 
         ws = FakeProviderWS()
         sess._gemini_ws = ws

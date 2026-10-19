@@ -4,13 +4,16 @@ import phonenumbers
 
 
 class StellaError(Exception):
-    def __init__(self, message: str, code: str = "stella_error") -> None:
+    def __init__(self, message: str, code: str = "stella_error", **details: object) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
     def to_dict(self) -> dict:
-        return {"error": self.code, "message": self.message}
+        data = {"error": self.code, "message": self.message}
+        data.update(self.details)
+        return data
 
 
 def normalize_e164(raw: str) -> str:

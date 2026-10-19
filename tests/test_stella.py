@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from typing import Any
 
 import httpx
@@ -144,6 +145,32 @@ def test_place_call_fails_without_gemini_key(tmp_path):
     assert transport.calls == []
 
 
+def test_place_call_returns_busy_without_dialing(tmp_path):
+    settings = make_settings(tmp_path)
+    store = JobStore(settings.stella_db_path)
+    transport = FakeTransport()
+    svc = JobService(settings, store, TelnyxClient(settings, transport))
+    active = store.create(kind="inbound", to_number="+4917612345678", brief="Simon ruft an.")
+    store.update(active.id, status="in_progress")
+    with pytest.raises(StellaError) as ei:
+        svc.place_call(to="+14155552671", brief="hello")
+    assert ei.value.code == "busy"
+    assert ei.value.details["call_id"] == active.id
+    assert active.id in ei.value.message
+    assert transport.calls == []
+    assert [job.id for job in store.list_recent(10)] == [active.id]
+    mcp = build_mcp(svc)
+    tool = next(t for t in mcp._tool_manager.list_tools() if t.name == "stella_call")
+    body = tool.fn(to="+14155552671", brief="hello")
+    assert body["error"] == "busy"
+    assert body["call_id"] == active.id
+    assert transport.calls == []
+    store.update(active.id, status="completed")
+    job = svc.place_call(to="+14155552671", brief="hello")
+    assert job.status == "dialing"
+    assert transport.calls
+
+
 def test_place_call_uses_gemini(tmp_path):
     settings = make_settings(tmp_path)
     store = JobStore(settings.stella_db_path)
@@ -186,6 +213,55 @@ def test_webhook_updates_status(tmp_path):
     done = store.get(job.id)
     assert done.status == "completed"
     assert "normal_clearing" in done.outcome
+
+
+def test_owner_prompt_prefers_direct_tools_and_du(tmp_path):
+    settings = make_settings(tmp_path, stella_owner_number=OWNER)
+    store = JobStore(settings.stella_db_path)
+    job = store.create(
+        kind="inbound",
+        to_number=OWNER,
+        brief="Simon ruft an.",
+        speak_to="Simon",
+        allow_ida=True,
+    )
+    text = build_instructions(
+        job,
+        ask_ida=True,
+        owner=True,
+        mcp_tools=[
+            ("google__list_events", "Kalender"),
+            ("ha__state", "Zuhause"),
+            ("untis__stundenplan", "Stundenplan"),
+            ("memory__search_nodes", "Memory"),
+        ],
+    )
+    assert "Never Sie, Ihnen, Ihr, or Ihre" in text
+    assert "du, dich, dir, dein" in text
+    for prefix in ("google__", "ha__", "untis__", "memory__"):
+        assert prefix in text
+    assert "Was steht heute an?" in text
+    assert "never frag_ida" in text
+    assert "only when no direct tool fits" in text
+    # The no-MCP path still points calendar questions at frag_ida.
+    plain = build_instructions(job, ask_ida=True, owner=True)
+    assert "through frag_ida, you can reach all" in plain
+    assert "google__" not in plain
+    sess = GeminiVoiceSession(
+        settings=ida_settings(tmp_path),
+        job=job,
+        gemini_connect=None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+    sess._mcp = type("Pool", (), {"declarations": lambda self: [{"name": "google__list_events"}], "catalog": lambda self: [("google__list_events", "Kalender")]})()
+    payload = sess._setup_payload()
+    frag = next(
+        d for t in payload["tools"] for d in t["functionDeclarations"] if d["name"] == "frag_ida"
+    )
+    assert "Nur Fallback" in frag["description"]
+    assert "Was steht heute an?" in frag["description"]
 
 
 def test_instructions_contain_only_job_context(tmp_path):
@@ -1315,6 +1391,84 @@ async def test_gemini_client_vad_sends_activity_end(tmp_path):
     assert any(k == "audio" for k in kinds)
 
 
+def _activity_kinds(sent: list) -> list[str]:
+    kinds = []
+    for msg in sent:
+        ri = msg.get("realtimeInput") or {}
+        if "activityStart" in ri:
+            kinds.append("start")
+        elif "activityEnd" in ri:
+            kinds.append("end")
+        elif "audio" in ri:
+            kinds.append("audio")
+    return kinds
+
+
+@pytest.mark.asyncio
+async def test_greeting_barge_in_blocked_until_sentence_and_floor(tmp_path):
+    """Noise just after answer must not emit activityEnd or clear the greeting."""
+    settings = make_settings(
+        tmp_path,
+        gemini_api_key="g-key",
+        stella_client_vad=True,
+        stella_client_vad_min_speech_ms=20,
+        stella_client_vad_silence_ms=40,
+        stella_client_vad_rms=200,
+        stella_greeting_barge_in_s=2.5,
+    )
+    store = JobStore(settings.stella_db_path)
+    job = store.create(kind="call", to_number="+14155552671", brief="Hi")
+    session = GeminiVoiceSession(
+        settings=settings,
+        job=job,
+        gemini_connect=lambda u, h: None,
+        hangup_cb=lambda: None,
+        transcript_cb=lambda c: None,
+        outcome_cb=lambda t: None,
+    )
+
+    class DummyGemini:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data) if isinstance(data, str) else data)
+
+    session._gemini_ws = DummyGemini()
+    session._telnyx_ws = FakeTelnyxWS()
+    speech, _ = _speech_frames(3, 0)
+    silence = _pcm16_frame(0, 6)
+
+    session.note_answered()
+    await session._forward_inbound_pcm(speech)
+    await session._forward_inbound_pcm(silence)
+    assert _activity_kinds(session._gemini_ws.sent) == []
+
+    await session._handle_gemini_event(
+        {"serverContent": {"interrupted": True, "outputTranscription": {"text": "Ja, Simon?"}}}
+    )
+    assert session._telnyx_ws.sent == []
+    assert session._greeting_turn_done is False
+
+    await session._handle_gemini_event({"serverContent": {"turnComplete": True}})
+    assert session._greeting_turn_done is True
+    session._gemini_ws.sent.clear()
+    await session._forward_inbound_pcm(speech)
+    await session._forward_inbound_pcm(silence)
+    assert _activity_kinds(session._gemini_ws.sent) == []
+
+    session._answered_mono = time.monotonic() - 3
+    await session._forward_inbound_pcm(speech)
+    await session._forward_inbound_pcm(silence)
+    kinds = _activity_kinds(session._gemini_ws.sent)
+    assert "start" in kinds and "end" in kinds
+    assert session._barge_in_open is True
+
+    session._telnyx_ws.sent.clear()
+    await session._handle_gemini_event({"serverContent": {"interrupted": True}})
+    assert any("clear" in item for item in session._telnyx_ws.sent)
+
+
 @pytest.mark.asyncio
 async def test_gemini_farewell_hangup_backup(tmp_path):
     settings = make_settings(
@@ -1720,7 +1874,9 @@ def test_ida_allowed_only_for_owner(tmp_path):
 def test_place_call_sets_allow_ida_only_for_owner(tmp_path):
     settings = ida_settings(tmp_path)
     svc = JobService(settings, JobStore(settings.stella_db_path), TelnyxClient(settings, FakeTransport()))
-    assert svc.place_call(to=OWNER, brief="hi").allow_ida is True
+    first = svc.place_call(to=OWNER, brief="hi")
+    assert first.allow_ida is True
+    svc.store.update(first.id, status="completed")
     assert svc.place_call(to="+14155552671", brief="hi", allow_ida=True).allow_ida is False
 
 
@@ -1789,6 +1945,7 @@ async def test_owner_greeting_and_jarvis_kickoff_independent_of_ida(tmp_path):
     assert "Simon, kurz wegen" in owned
     assert "Ich hab schon" in owned
     assert "Ida's phone persona, warm German, female, du-form" in owned
+    assert "Never Sie, Ihnen, Ihr, or Ihre" in owned
     assert "Erinner ihn an den Termin" in owned
     assert "hang_up" in owned
     assert owner_kickoff_text(job) == OWNER_KICKOFF_OUTBOUND

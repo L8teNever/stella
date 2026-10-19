@@ -74,6 +74,14 @@ class CallJob:
         }
 
 
+class ChannelBusy(Exception):
+    """Raised when a new outbound call would exceed the single live channel."""
+
+    def __init__(self, call_id: str) -> None:
+        super().__init__(call_id)
+        self.call_id = call_id
+
+
 class JobStore:
     def __init__(self, db_path: str) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +173,7 @@ class JobStore:
         context: str = "",
         speak_to: str = "",
         allow_ida: bool = False,
+        reject_if_status: Collection[str] | None = None,
     ) -> CallJob:
         job = CallJob(
             id=str(uuid.uuid4()),
@@ -189,6 +198,16 @@ class JobStore:
             updated_at=_now(),
         )
         with self._lock, self._connect() as conn:
+            if reject_if_status:
+                keys = tuple(dict.fromkeys(reject_if_status))
+                placeholders = ",".join("?" for _ in keys)
+                active = conn.execute(
+                    "SELECT id FROM jobs WHERE status IN ("
+                    f"{placeholders}) ORDER BY created_at ASC, id ASC LIMIT 1",
+                    keys,
+                ).fetchone()
+                if active:
+                    raise ChannelBusy(active["id"])
             conn.execute(
                 """
                 INSERT INTO jobs (

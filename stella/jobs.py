@@ -13,7 +13,7 @@ from stella.audio_pcmu import codec_from_telnyx_payload, preferred_telnyx_codec
 from stella.config import Settings
 from stella.ask_ida import ida_allowed_for
 from stella.errors import StellaError, normalize_e164
-from stella.store import CallJob, JobStore
+from stella.store import CallJob, ChannelBusy, JobStore
 from stella.telnyx_client import TelnyxClient
 
 logger = logging.getLogger(__name__)
@@ -112,14 +112,22 @@ class JobService:
             )
         provider = "gemini"
         media_codec = preferred_telnyx_codec(self.settings.telnyx_from_number, to_e164)
-        job = self.store.create(
-            kind=kind,
-            to_number=to_e164,
-            brief=brief.strip(),
-            context=(context or "").strip(),
-            speak_to=(speak_to or "").strip(),
-            allow_ida=ida_allowed_for(self.settings, to_e164, allow_ida),
-        )
+        try:
+            job = self.store.create(
+                kind=kind,
+                to_number=to_e164,
+                brief=brief.strip(),
+                context=(context or "").strip(),
+                speak_to=(speak_to or "").strip(),
+                allow_ida=ida_allowed_for(self.settings, to_e164, allow_ida),
+                reject_if_status=BUSY_STATUSES,
+            )
+        except ChannelBusy as exc:
+            raise StellaError(
+                f"Stella is already on a call ({exc.call_id}).",
+                "busy",
+                call_id=exc.call_id,
+            ) from exc
         self.store.update(job.id, voice_provider=provider, media_codec=media_codec)
         webhook = self.settings.public_http_url("/webhooks/telnyx")
         stream = self.settings.public_ws_url(f"/media/{job.id}")

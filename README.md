@@ -66,6 +66,8 @@ The in-repo default is **`gemini-3.8-live`**, not 3.1 Flash Live and not any 2.5
 
 **Hang-up:** The model must call `hang_up` to drop the PSTN leg (spoken “tschüss” is not enough). TelnyxMediaGuard still waits for stream start and outbound playout. A backup fires if the spoken transcript looks like a farewell and inbound stays quiet for `STELLA_FAREWELL_HANGUP_S` (disable with `STELLA_FAREWELL_HANGUP=false`).
 
+**Greeting:** For `STELLA_GREETING_BARGE_IN_S` seconds after answer (default 2.5), and until that first sentence has actually finished, Stella drops inbound audio and activity markers. Line noise was sending `activityEnd` several times and `START_OF_ACTIVITY_INTERRUPTS` kept restarting the greeting. Barge-in works as usual after that.
+
 ## Frag Ida (Claude Code im Anruf)
 
 On a call to the **owner number**, Gemini can look up Simon’s personal data (calendar, timetable, homework, mail read-only, smart-home status) via the function tool `frag_ida`:
@@ -100,6 +102,22 @@ On the same owner calls that get `frag_ida`, Gemini can also call MCP servers it
 ```bash
 STELLA_MCP_SERVERS='[{"name":"calendar","url":"https://calendar.example/mcp","token_env":"CALENDAR_MCP_TOKEN","allow":["list_events","get_event"]}]'
 STELLA_MCP_TOOL_TIMEOUT_S=8
+```
+
+### Memory after the call
+
+When an **owner** call ends — Simon hangs up, Stella hangs up, or the leg fails or times out — Stella reads the stored transcript and writes durable facts into the Memory MCP server. The work is a background task started after the hangup status is saved. It does not delay the webhook response or the job status. Repeated hangup events for the same call run the write at most once.
+
+Stella asks Claude (`claude -p`, model `ASK_IDA_MODEL`) to return only lasting facts: new information about Simon, other people, appointments and commitments, preferences, decisions, tasks. Smalltalk, tests, and duplicates are dropped. An empty result writes nothing.
+
+Writes go to the server whose `name` is `STELLA_POST_CALL_MEMORY_SERVER` (default `memory`) inside `STELLA_MCP_SERVERS`. Stella calls `search_nodes` first, then `create_entities`, `add_observations`, or `create_relations`. It never calls `delete_*`. If that server is missing, Stella logs `stella_memory skip reason=no_server` and leaves the call alone. Other numbers are skipped.
+
+`stella_call_status` then includes `memory_summary` and `memory_written` (the sentences that were stored, or an error in `memory_summary`).
+
+```bash
+STELLA_POST_CALL_MEMORY=true
+STELLA_POST_CALL_MEMORY_SERVER=memory
+STELLA_MCP_SERVERS='[{"name":"memory","url":"https://memory.example/mcp","token_env":"MEMORY_MCP_TOKEN","allow":["search_nodes","create_entities","add_observations","create_relations"]}]'
 ```
 
 ## Telnyx

@@ -165,10 +165,18 @@ def hang_up_tool_gemini() -> dict[str, Any]:
     }
 
 
-def ask_ida_tool_gemini() -> dict[str, Any]:
-    return {
-        "name": "frag_ida",
-        "description": (
+def ask_ida_tool_gemini(*, direct: bool = False) -> dict[str, Any]:
+    if direct:
+        description = (
+            "Nur Fallback. Zuerst ein direktes Tool nehmen, wenn der Name mit google__, ha__, "
+            "untis__ oder memory__ beginnt (Kalender, Mail, Zuhause, Stundenplan, Memory). "
+            "'Was steht heute an?' ist der Kalender (google__), nicht dieses Tool. "
+            "frag_ida nur, wenn kein direktes Tool passt oder die Frage echtes Nachdenken "
+            "über mehrere Quellen braucht. Frage im Wortlaut. Aktionen erst nach seinem Ja. "
+            "Nicht für Allgemeinwissen. Dauert deutlich länger als ein direktes Tool."
+        )
+    else:
+        description = (
             "Zugriff auf alles, was Simon gehört oder was über ihn und sein Umfeld bekannt ist: "
             "Personen und Wissen (z. B. 'wer ist Ludwig?'), Kalender, Stundenplan und Ausfälle, "
             "Hausaufgaben, Mails, Aufgaben, Kontakte, Smart Home, Erinnerungen, Notizen/Memory, "
@@ -177,7 +185,10 @@ def ask_ida_tool_gemini() -> dict[str, Any]:
             "Lesen geht direkt; Aktionen (Termin eintragen, Mail senden, Licht schalten, "
             "Erinnerung setzen ...) erst nach seinem ausdrücklichen Ja. Nicht für "
             "Allgemeinwissen. Dauert einige Sekunden. Vorher kurz sagen, dass du nachschaust."
-        ),
+        )
+    return {
+        "name": "frag_ida",
+        "description": description,
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -250,7 +261,7 @@ def gemini_tools(
 ) -> list[dict[str, Any]]:
     tools = hang_up_tool_gemini()
     if ask_ida:
-        tools["functionDeclarations"].append(ask_ida_tool_gemini())
+        tools["functionDeclarations"].append(ask_ida_tool_gemini(direct=bool(extra)))
         if callback:
             tools["functionDeclarations"].append(callback_tool_gemini())
     for decl in extra or []:
@@ -318,6 +329,31 @@ class GeminiVoiceSession:
         # Direct MCP tools share frag_ida's owner gate. Sessions exist only for this call.
         self._mcp: LiveMcpPool | None = None
         self._mcp_tasks: set[asyncio.Task] = set()
+        # Barge-in stays off until the greeting has finished and the post-answer floor elapsed.
+        self._answered_mono: float | None = None
+        self._greeting_heard = False
+        self._greeting_turn_done = False
+        self._barge_in_open = False
+
+    def note_answered(self) -> None:
+        if self._answered_mono is None:
+            self._answered_mono = time.monotonic()
+
+    def greeting_barge_blocked(self) -> bool:
+        """True while line noise must not cut the first sentence.
+
+        The lock opens only after the first model turn has finished and at least
+        ``stella_greeting_barge_in_s`` seconds have passed since the call was answered.
+        Before answer, markers pass through so a session with no media yet is unchanged.
+        """
+        if self._barge_in_open or self._answered_mono is None:
+            return False
+        floor = max(0.0, float(self.settings.stella_greeting_barge_in_s))
+        if (time.monotonic() - self._answered_mono) >= floor and self._greeting_turn_done:
+            self._barge_in_open = True
+            self._vad.reset()
+            return False
+        return True
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -490,6 +526,7 @@ class GeminiVoiceSession:
                 event = msg.get("event")
                 if event in {"start", "media"}:
                     self.guard.mark_started()
+                    self.note_answered()
                 if event == "start":
                     detected = codec_from_telnyx_payload(msg.get("start") or msg)
                     if detected:
@@ -515,7 +552,7 @@ class GeminiVoiceSession:
             logger.error("Gemini Live error: %s", event)
             return
         server = event.get("serverContent") or {}
-        if server.get("interrupted"):
+        if server.get("interrupted") and not self.greeting_barge_blocked():
             await self._on_barge_in()
         model_turn = server.get("modelTurn") or {}
         for part in model_turn.get("parts") or []:
@@ -523,6 +560,7 @@ class GeminiVoiceSession:
             data = inline.get("data")
             mime = inline.get("mimeType") or ""
             if data and "audio" in mime.lower():
+                self._greeting_heard = True
                 for payload in self._down.convert_frames_b64(data, mime):
                     sent = await self.guard.send_outbound_pcmu(self._telnyx_ws, payload)
                     if sent:
@@ -535,10 +573,13 @@ class GeminiVoiceSession:
         out_tx = server.get("outputTranscription") or {}
         piece = out_tx.get("text") or ""
         if piece:
+            self._greeting_heard = True
             self._assistant_bits.append(piece)
             self._note_dialog("Stella", piece)
             self._transcript(piece)
             self._farewell.note_assistant_text(piece)
+        if self._greeting_heard and (server.get("turnComplete") or server.get("generationComplete")):
+            self._greeting_turn_done = True
 
         tool_call = event.get("toolCall") or {}
         for fc in tool_call.get("functionCalls") or []:
@@ -698,6 +739,11 @@ class GeminiVoiceSession:
 
     async def _forward_inbound_pcm(self, pcm: bytes) -> None:
         assert self._gemini_ws is not None
+        # Noise right after answer was emitting activityEnd and
+        # START_OF_ACTIVITY_INTERRUPTS restarted the greeting. Drop the audio
+        # and the activity markers until the first sentence is done.
+        if self.greeting_barge_blocked():
+            return
         client_vad = gemini_uses_client_vad(self.settings)
         events = self._vad.feed(pcm) if client_vad else []
         if not client_vad and pcm_rms(pcm) >= self.settings.stella_client_vad_rms:

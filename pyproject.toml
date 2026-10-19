@@ -1,6 +1,6 @@
 [project]
 name = "stella"
-version = "0.1.4"
+version = "0.1.5"
 description = "Stella voice/phone stack — Telnyx Call Control + Gemini Live, dispatched via MCP"
 readme = "README.md"
 requires-python = ">=3.12"

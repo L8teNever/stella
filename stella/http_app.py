@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from stella import __version__, callback_bg, master_prompt
+from stella import __version__, callback_bg, master_prompt, post_call_memory
 from stella.config import Settings, get_settings
 from stella.errors import StellaError
 from stella.jobs import BERLIN, JobService
@@ -159,6 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"result": f"Eingeplant für {run_at:%H:%M} Uhr."}
 
         try:
+            post_call_memory.note_media_open(job_id)
             await start_voice_bridge(
                 settings=settings,
                 job=job,
@@ -174,6 +175,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:
             logger.exception("media session failed for %s", job_id)
             store.update(job_id, status="failed", error=str(exc)[:2000] or "voice session failed")
+        finally:
+            post_call_memory.note_media_closed(job_id)
+            post_call_memory.start(settings, store, job_id, wait_for_media=False)
 
     @app.middleware("http")
     async def normalize_mcp_case(request: Request, call_next):

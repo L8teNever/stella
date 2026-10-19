@@ -249,3 +249,118 @@ async def ask_ida(
             logger.info(
                 "stella_latency ask_ida_ms ms=%d", round((time.monotonic() - t0) * 1000)
             )
+
+
+DELETE_TOOL_DENY = "mcp__*__*delete*,mcp__*__*_loeschen,mcp__*__*loeschen*"
+
+
+def empty_mcp_config(settings: Settings) -> str:
+    """MCP config with no servers, so a Claude run cannot call tools."""
+    workdir = Path(settings.data_dir()) / "ask-ida"
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = workdir / "empty-mcp.json"
+    path.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    return str(path)
+
+
+def claude_argv(
+    settings: Settings,
+    *,
+    system_prompt: str,
+    max_turns: int,
+    mcp_config: str,
+    allowed_tools: list[str] | None = None,
+) -> list[str]:
+    """Headless Claude command. Same flags as frag_ida, model from ASK_IDA_MODEL.
+
+    ``allowed_tools`` omitted means no ``--allowedTools`` entry. Delete-style MCP
+    tools are always disallowed.
+    """
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format", "text",
+        "--model", settings.ask_ida_model,
+        "--max-turns", str(int(max_turns)),
+        "--mcp-config", mcp_config,
+        "--strict-mcp-config",
+        "--tools", "",
+        "--permission-mode", "dontAsk",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--append-system-prompt", system_prompt,
+        "--disallowedTools", ",".join((BUILTIN_DENY, DELETE_TOOL_DENY)),
+    ]
+    if allowed_tools:
+        cmd += ["--allowedTools", ",".join(allowed_tools)]
+    return cmd
+
+
+async def run_claude(
+    settings: Settings,
+    prompt: str,
+    *,
+    system_prompt: str,
+    allowed_tools: list[str] | None = None,
+    max_turns: int = 1,
+    timeout_s: float | None = None,
+    spawn: Spawn | None = None,
+    mcp_config: str | None = None,
+    max_prompt_chars: int = 16000,
+    max_answer_chars: int = 8000,
+) -> str:
+    """Run ``claude -p`` with ASK_IDA_MODEL. Does not log the prompt."""
+    prompt = (prompt or "").strip()[:max_prompt_chars]
+    if not prompt:
+        return MSG_FAILED
+    spawn = spawn or asyncio.create_subprocess_exec
+    config = mcp_config if mcp_config is not None else empty_mcp_config(settings)
+    cmd = claude_argv(
+        settings,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        mcp_config=config,
+        allowed_tools=allowed_tools,
+    )
+    workdir = Path(settings.data_dir()) / "ask-ida"
+    workdir.mkdir(parents=True, exist_ok=True)
+    proc = None
+    logger.info("run_claude model=%s chars=%d", settings.ask_ida_model, len(prompt))
+    try:
+        proc = await spawn(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(workdir),
+            env=build_env(settings),
+        )
+        comm = asyncio.ensure_future(proc.communicate(prompt.encode("utf-8")))
+        limit = timeout_s if timeout_s is not None else settings.ask_ida_timeout_s
+        done, _ = await asyncio.wait({comm}, timeout=limit)
+        if comm not in done:
+            comm.cancel()
+            await _kill(proc)
+            logger.warning("run_claude timed out after %.0fs", limit)
+            return MSG_TIMEOUT
+        stdout, stderr = comm.result()
+        if proc.returncode != 0:
+            logger.warning(
+                "run_claude exit=%s stderr=%s",
+                proc.returncode,
+                clip(stderr.decode("utf-8", "replace"), 300),
+            )
+            return MSG_FAILED
+        answer = stdout.decode("utf-8", "replace").strip()
+        if len(answer) > max_answer_chars:
+            answer = answer[:max_answer_chars]
+        return answer or MSG_EMPTY
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _kill(proc)
+        raise
+    except Exception:
+        logger.exception("run_claude failed")
+        if proc is not None:
+            await _kill(proc)
+        return MSG_FAILED

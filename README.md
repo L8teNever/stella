@@ -102,6 +102,22 @@ STELLA_MCP_SERVERS='[{"name":"calendar","url":"https://calendar.example/mcp","to
 STELLA_MCP_TOOL_TIMEOUT_S=8
 ```
 
+### Memory after the call
+
+When an **owner** call ends — Simon hangs up, Stella hangs up, or the leg fails or times out — Stella reads the stored transcript and writes durable facts into the Memory MCP server. The work is a background task started after the hangup status is saved. It does not delay the webhook response or the job status. Repeated hangup events for the same call run the write at most once.
+
+Stella asks Claude (`claude -p`, model `ASK_IDA_MODEL`) to return only lasting facts: new information about Simon, other people, appointments and commitments, preferences, decisions, tasks. Smalltalk, tests, and duplicates are dropped. An empty result writes nothing.
+
+Writes go to the server whose `name` is `STELLA_POST_CALL_MEMORY_SERVER` (default `memory`) inside `STELLA_MCP_SERVERS`. Stella calls `search_nodes` first, then `create_entities`, `add_observations`, or `create_relations`. It never calls `delete_*`. If that server is missing, Stella logs `stella_memory skip reason=no_server` and leaves the call alone. Other numbers are skipped.
+
+`stella_call_status` then includes `memory_summary` and `memory_written` (the sentences that were stored, or an error in `memory_summary`).
+
+```bash
+STELLA_POST_CALL_MEMORY=true
+STELLA_POST_CALL_MEMORY_SERVER=memory
+STELLA_MCP_SERVERS='[{"name":"memory","url":"https://memory.example/mcp","token_env":"MEMORY_MCP_TOKEN","allow":["search_nodes","create_entities","add_observations","create_relations"]}]'
+```
+
 ## Telnyx
 
 1. Create a Call Control application / Voice API connection.

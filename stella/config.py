@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     stella_mcp_servers: str = ""
     # Per tool call. The phone session keeps streaming audio while this runs.
     stella_mcp_tool_timeout_s: float = 8.0
+    # After an owner call ends, extract durable facts (ASK_IDA_MODEL) and write
+    # them to the MCP server named here (an entry in STELLA_MCP_SERVERS).
+    stella_post_call_memory: bool = True
+    stella_post_call_memory_server: str = "memory"
     # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.
     anthropic_api_key: str = ""
     claude_code_oauth_token: str = ""

@@ -15,6 +15,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def memory_written_list(raw: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data if str(item).strip()]
+
+
 @dataclass
 class CallJob:
     id: str
@@ -32,6 +45,9 @@ class CallJob:
     voice_provider: str
     allow_ida: bool
     media_codec: str
+    memory_done: bool
+    memory_summary: str
+    memory_written: str
     created_at: str
     updated_at: str
 
@@ -51,6 +67,8 @@ class CallJob:
             "voice_provider": self.voice_provider or None,
             "allow_ida": self.allow_ida,
             "media_codec": self.media_codec or None,
+            "memory_summary": self.memory_summary or None,
+            "memory_written": memory_written_list(self.memory_written),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -87,6 +105,10 @@ class JobStore:
                     error TEXT NOT NULL DEFAULT '',
                     voice_provider TEXT NOT NULL DEFAULT '',
                     allow_ida INTEGER NOT NULL DEFAULT 0,
+                    media_codec TEXT NOT NULL DEFAULT '',
+                    memory_done INTEGER NOT NULL DEFAULT 0,
+                    memory_summary TEXT NOT NULL DEFAULT '',
+                    memory_written TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -104,6 +126,18 @@ class JobStore:
                 pass
             try:
                 conn.execute("ALTER TABLE jobs ADD COLUMN media_codec TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN memory_done INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN memory_summary TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN memory_written TEXT NOT NULL DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
             conn.execute(
@@ -148,6 +182,9 @@ class JobStore:
             voice_provider="",
             allow_ida=bool(allow_ida),
             media_codec="",
+            memory_done=False,
+            memory_summary="",
+            memory_written="",
             created_at=_now(),
             updated_at=_now(),
         )
@@ -252,6 +289,16 @@ class JobStore:
             conn.commit()
         return self.get(job_id)
 
+    def claim_memory(self, job_id: str) -> bool:
+        """Mark post-call memory as started. True only for the first caller."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET memory_done = 1, updated_at = ? WHERE id = ? AND memory_done = 0",
+                (_now(), job_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
     def append_transcript(self, job_id: str, chunk: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -303,6 +350,9 @@ class JobStore:
             voice_provider=row["voice_provider"] if "voice_provider" in row.keys() else "",
             allow_ida=bool(row["allow_ida"]) if "allow_ida" in row.keys() else False,
             media_codec=row["media_codec"] if "media_codec" in row.keys() else "",
+            memory_done=bool(row["memory_done"]) if "memory_done" in row.keys() else False,
+            memory_summary=row["memory_summary"] if "memory_summary" in row.keys() else "",
+            memory_written=row["memory_written"] if "memory_written" in row.keys() else "",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

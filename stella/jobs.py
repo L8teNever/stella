@@ -262,6 +262,10 @@ class JobService:
             updated = self.store.update(job.id, **fields)
             if updated and event_type == "call.hangup":
                 self._maybe_callback(updated)
+        # Hangup from either side, streaming failure, and later the media-session
+        # close all schedule this. The claim inside the task makes it run once.
+        if event_type in {"call.hangup", "streaming.failed"}:
+            self._schedule_post_call_memory(job.id)
 
     def _looks_outbound(self, payload: dict[str, Any]) -> bool:
         direction = str(
@@ -397,6 +401,11 @@ class JobService:
             outcome="unknown caller",
             allow_ida=False,
         )
+
+    def _schedule_post_call_memory(self, job_id: str) -> None:
+        from stella import post_call_memory
+
+        post_call_memory.start(self.settings, self.store, job_id, wait_for_media=True)
 
     def hangup(self, job: CallJob) -> None:
         if job.telnyx_call_control_id:

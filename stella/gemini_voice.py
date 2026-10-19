@@ -19,6 +19,7 @@ from stella.audio_pcmu import (
 )
 from stella.config import Settings
 from stella.errors import StellaError
+from stella.live_mcp import LiveMcpPool, live_mcp_enabled, parse_mcp_servers
 from stella.energy_vad import EnergyVad, energy_vad_config_from_settings, pcm_rms
 from stella.store import CallJob
 from stella.voice import (
@@ -241,12 +242,19 @@ def callback_tool_gemini() -> dict[str, Any]:
     }
 
 
-def gemini_tools(*, ask_ida: bool, callback: bool = False) -> list[dict[str, Any]]:
+def gemini_tools(
+    *,
+    ask_ida: bool,
+    callback: bool = False,
+    extra: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     tools = hang_up_tool_gemini()
     if ask_ida:
         tools["functionDeclarations"].append(ask_ida_tool_gemini())
         if callback:
             tools["functionDeclarations"].append(callback_tool_gemini())
+    for decl in extra or []:
+        tools["functionDeclarations"].append(decl)
     return [tools]
 
 
@@ -307,6 +315,9 @@ class GeminiVoiceSession:
         self._ask_ida = bool(job.allow_ida) and ida_allowed_for(settings, job.to_number)
         self._ida_task: asyncio.Task | None = None
         self._ida_cancel = asyncio.Event()
+        # Direct MCP tools share frag_ida's owner gate. Sessions exist only for this call.
+        self._mcp: LiveMcpPool | None = None
+        self._mcp_tasks: set[asyncio.Task] = set()
 
     async def attach_telnyx(self, telnyx_ws) -> None:
         self._telnyx_ws = telnyx_ws
@@ -316,8 +327,16 @@ class GeminiVoiceSession:
     async def connect(self) -> None:
         if not (self.settings.gemini_api_key or "").strip():
             raise RuntimeError("GEMINI_API_KEY is not set; cannot open Gemini Live session.")
-        last_exc: Exception | None = None
         url = gemini_ws_url(self.settings)
+        await self._open_live_mcp()
+        try:
+            await self._connect_gemini(url)
+        except Exception:
+            await self._close_live_mcp()
+            raise
+
+    async def _connect_gemini(self, url: str) -> None:
+        last_exc: Exception | None = None
         for model in gemini_live_try_order(self.settings):
             self._active_model = model
             try:
@@ -398,6 +417,8 @@ class GeminiVoiceSession:
 
     def _setup_payload(self) -> dict[str, Any]:
         model = self._active_model
+        extra = self._mcp.declarations() if self._mcp else None
+        catalog = self._mcp.catalog() if self._mcp else None
         return {
             "model": gemini_model_name(self.settings, model),
             "generationConfig": gemini_generation_config(self.settings, model),
@@ -408,10 +429,15 @@ class GeminiVoiceSession:
                         ask_ida=self._ask_ida,
                         callback=bool(self._schedule_cb),
                         owner=self._owner,
+                        mcp_tools=catalog,
                     )
                 }]
             },
-            "tools": gemini_tools(ask_ida=self._ask_ida, callback=bool(self._schedule_cb)),
+            "tools": gemini_tools(
+                ask_ida=self._ask_ida,
+                callback=bool(self._schedule_cb),
+                extra=extra,
+            ),
             "outputAudioTranscription": {},
             "inputAudioTranscription": {},
             "realtimeInputConfig": gemini_realtime_input_config(self.settings),
@@ -517,6 +543,9 @@ class GeminiVoiceSession:
         tool_call = event.get("toolCall") or {}
         for fc in tool_call.get("functionCalls") or []:
             name = fc.get("name")
+            if self._mcp is not None and name in self._mcp:
+                self._start_mcp_call(fc)
+                continue
             if name == "frag_ida" and self._ask_ida:
                 self._start_ask_ida(fc)
                 continue
@@ -582,6 +611,69 @@ class GeminiVoiceSession:
                 }
             )
         )
+
+    def _start_mcp_call(self, fc: dict[str, Any]) -> None:
+        """Run one MCP tool off the audio loop. Gemini already spoke a short filler."""
+        task = asyncio.create_task(self._run_mcp_call(fc))
+        self._mcp_tasks.add(task)
+        task.add_done_callback(self._mcp_tasks.discard)
+
+    async def _run_mcp_call(self, fc: dict[str, Any]) -> None:
+        name = str(fc.get("name") or "")
+        args = fc.get("args") or fc.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        pool = self._mcp
+        if pool is None:
+            response: dict[str, str] = {"error": "Das Tool ist gerade nicht erreichbar."}
+        else:
+            try:
+                response = await pool.call(name, args)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.info("stella_mcp tool=%s ms=0 ok=error reason=internal", name)
+                response = {"error": "Das Tool ist gerade nicht erreichbar."}
+        try:
+            await self._send_function_response(fc.get("id"), name, response)
+        except Exception:
+            logger.info("stella_mcp tool=%s ms=0 ok=error reason=send", name)
+
+    async def _open_live_mcp(self) -> None:
+        if self._mcp is not None:
+            return
+        if not live_mcp_enabled(self.settings, self.job.to_number, bool(self.job.allow_ida)):
+            return
+        specs = parse_mcp_servers(self.settings.stella_mcp_servers)
+        timeout = float(self.settings.stella_mcp_tool_timeout_s or 8.0)
+        pool = LiveMcpPool(specs, tool_timeout_s=max(0.2, timeout))
+        try:
+            await pool.open()
+        except Exception:
+            logger.info("stella_mcp ok=error reason=open")
+            await pool.close()
+            return
+        if not pool.declarations():
+            await pool.close()
+            return
+        self._mcp = pool
+
+    async def _close_live_mcp(self) -> None:
+        tasks = list(self._mcp_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._mcp_tasks.clear()
+        pool = self._mcp
+        self._mcp = None
+        if pool is not None:
+            await pool.close()
 
     def _start_ask_ida(self, fc: dict[str, Any]) -> None:
         """Run frag_ida in a task so audio, VAD and the hangup guard keep running."""
@@ -693,6 +785,7 @@ class GeminiVoiceSession:
             self._ida_task.cancel()
         self._setup_complete.set()
         self.guard.mark_started()
+        await self._close_live_mcp()
         if self._gemini_ws is None:
             return
         try:

@@ -91,6 +91,17 @@ The call is handled in a background task, so audio, VAD, hang-up and farewell gu
 
 **Latency:** a lookup takes several seconds (Claude start + MCP + model; ~4–6 s measured locally with one tool). With `STELLA_LATENCY_LOG=true`, Stella logs `stella_latency ask_ida_ms ms=<n>`. Timeout: `ASK_IDA_TIMEOUT_S` (default 25 s).
 
+### Direct MCP tools on the call
+
+On the same owner calls that get `frag_ida`, Gemini can also call MCP servers itself for a simple lookup or a single action. `frag_ida` stays the fallback when the question needs reasoning or several sources. Each call opens its own Streamable HTTP sessions and closes them when the call ends. A dropped session is reconnected once. Tool calls run in the background so phone audio keeps moving; the prompt tells Gemini to say a short “Moment.” first. Each call times out after `STELLA_MCP_TOOL_TIMEOUT_S` (default 8). Stella logs `stella_mcp tool=<name> ms=<n> ok=ok|error reason=<code>` and never logs arguments, results, or tokens.
+
+`STELLA_MCP_SERVERS` is a JSON list. `token_env` is the **name** of an env var that holds the bearer token. `allow` is optional; omit it to expose every tool on that server, or set it to keep the tool list small. Names are prefixed as `server__tool` so two servers cannot collide.
+
+```bash
+STELLA_MCP_SERVERS='[{"name":"calendar","url":"https://calendar.example/mcp","token_env":"CALENDAR_MCP_TOKEN","allow":["list_events","get_event"]}]'
+STELLA_MCP_TOOL_TIMEOUT_S=8
+```
+
 ## Telnyx
 
 1. Create a Call Control application / Voice API connection.

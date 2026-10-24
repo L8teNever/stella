@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from stella import call_sessions
 from stella.audio_pcmu import codec_from_telnyx_payload, preferred_telnyx_codec
 from stella.config import Settings
 from stella.ask_ida import ida_allowed_for
@@ -22,16 +24,19 @@ BERLIN = ZoneInfo("Europe/Berlin")
 MAX_SCHEDULE_AHEAD = timedelta(days=14)
 _HHMM = re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:uhr)?\s*$", re.IGNORECASE)
 INBOUND_UNKNOWN_MODES = frozenset({"hangup", "speak", "answer"})
-# Line is in use until a terminal status. `queued` covers the Telnyx dial itself
-# (status stays queued until the dial HTTP returns). `initiated` is ringing.
+# The PSTN leg is up (or the dial HTTP is in flight). `completing` is only
+# post-hangup bookkeeping and must not block the next call.
 BUSY_STATUSES = frozenset({
     "queued",
     "dialing",
     "initiated",
     "in_progress",
-    "completing",
     "rejecting",
 })
+TERMINAL_STATUSES = frozenset({"completed", "failed", "rejected"})
+# Watched by the reaper. Includes post-hangup `completing`, which is not busy.
+NON_TERMINAL_STATUSES = BUSY_STATUSES | frozenset({"completing"})
+_ENDED_LIVENESS = frozenset({"ended", "ended_90015"})
 DEFAULT_INBOUND_BRIEF = (
     "Du bist Stella. Simon ruft an — führe ein normales kurzes Gespräch auf Deutsch."
 )
@@ -266,9 +271,19 @@ class JobService:
             except StellaError as exc:
                 logger.warning("inbound reject hangup failed: %s", exc.message)
             fields["status"] = "rejected"
+        # A late webhook must not pull a finished job back onto the line.
+        # Status is applied with a conditional write so a snapshot taken before
+        # our own hangup cannot demote `completed`. `failed` may still move to
+        # `completed` when call.hangup follows streaming.failed.
+        new_job_status = fields.pop("status", None)
+        if new_job_status and not _webhook_status_allowed(job.status, new_job_status):
+            new_job_status = None
+        updated = job
         if fields:
-            updated = self.store.update(job.id, **fields)
-            if updated and event_type == "call.hangup":
+            updated = self.store.update(job.id, **fields) or updated
+        if new_job_status:
+            updated, changed = self.store.update_call_status(job.id, new_job_status)
+            if changed and updated and event_type == "call.hangup":
                 self._maybe_callback(updated)
         # Hangup from either side, streaming failure, and later the media-session
         # close all schedule this. The claim inside the task makes it run once.
@@ -415,12 +430,217 @@ class JobService:
 
         post_call_memory.start(self.settings, self.store, job_id, wait_for_media=True)
 
-    def hangup(self, job: CallJob) -> None:
-        if job.telnyx_call_control_id:
+    def note_outcome(self, job_id: str, text: str) -> CallJob | None:
+        """Spoken outcome. Never moves `completed` / `failed` / `rejected` back to completing."""
+        return self.store.note_outcome(job_id, text, terminal_statuses=TERMINAL_STATUSES)
+
+    def hangup(self, job: CallJob) -> bool:
+        """Hang up the Telnyx leg. True when the leg is down, including error 90015."""
+        if not job.telnyx_call_control_id:
+            return False
+        try:
+            self.telnyx.hangup(job.telnyx_call_control_id)
+        except StellaError as exc:
+            if exc.code == "telnyx_call_ended":
+                logger.info("hangup %s: telnyx call already ended", job.id)
+                return True
+            logger.warning("hangup failed for %s: %s", job.id, exc.message)
+            return False
+        return True
+
+    def hangup_own_leg(self, job: CallJob) -> CallJob | None:
+        """After our own hangup succeeds, mark the job completed. Do not wait for call.hangup."""
+        if job.status in TERMINAL_STATUSES:
+            return job
+        if not self.hangup(job):
+            return self.store.get(job.id)
+        done = self.finish_call(job.id, status="completed")
+        # Memory waits for the media socket to close. Status is already terminal.
+        self._schedule_post_call_memory(job.id)
+        return done
+
+    def finish_call(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error: str = "",
+        outcome: str = "",
+    ) -> CallJob | None:
+        """Move a non-terminal job to a terminal status. A terminal job is left as it is."""
+        job = self.store.get(job_id)
+        if job is None:
+            return None
+        if job.status in TERMINAL_STATUSES:
+            return job
+        fields: dict[str, Any] = {"status": status}
+        if error:
+            fields["error"] = error[:2000]
+        merged = _merge_outcome(job.outcome, outcome)
+        if merged and merged != job.outcome:
+            fields["outcome"] = merged
+        updated, changed = self.store.update_unless(
+            job_id,
+            unless_status=TERMINAL_STATUSES,
+            **fields,
+        )
+        if changed and updated is not None and updated.status in TERMINAL_STATUSES:
+            logger.info("stella_call terminal job=%s status=%s", job_id, updated.status)
+            self._maybe_callback(updated)
+        return updated
+
+    def finalize_session(self, job_id: str, *, failed: bool = False, error: str = "") -> None:
+        """Media/WebSocket end: terminal status first, memory hook after, never the other way around."""
+        try:
+            current = self.store.get(job_id)
+            status = "failed" if failed else "completed"
+            # A reject-speak leg has no successful conversation. Telnyx 90015
+            # still finishes as completed; that path does not come through here.
+            if current is not None and status == "completed" and current.status == "rejecting":
+                status = "rejected"
+            self.finish_call(
+                job_id,
+                status=status,
+                error=(error or "voice session failed") if failed else "",
+            )
+        except Exception:
+            logger.exception("finish_call failed job=%s", job_id)
             try:
-                self.telnyx.hangup(job.telnyx_call_control_id)
-            except StellaError as exc:
-                logger.warning("hangup failed for %s: %s", job.id, exc.message)
+                self.store.update_unless(
+                    job_id,
+                    unless_status=TERMINAL_STATUSES,
+                    status="failed",
+                    error=(error or "voice session failed")[:2000],
+                )
+            except Exception:
+                logger.exception("terminal status fallback failed job=%s", job_id)
+        finally:
+            self._schedule_post_call_memory(job_id)
+
+    def plan_recovery(
+        self,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+        force: bool,
+        liveness: str,
+    ) -> tuple[str, str, bool] | None:
+        """Decide whether a non-terminal row should be finished.
+
+        Returns `(status, reason, hangup)` or None to leave the job alone.
+        `hangup` is true when this process should still send Telnyx hangup.
+        """
+        status = str(row.get("status") or "")
+        if status in TERMINAL_STATUSES or status not in NON_TERMINAL_STATUSES:
+            return None
+        ended = liveness in _ENDED_LIVENESS
+        limit = (
+            float(self.settings.stella_stale_completing_s)
+            if status == "completing"
+            else float(self.settings.stella_stale_call_s)
+        )
+        stale = _row_age_s(row, now) >= max(0.0, limit)
+        if not force and not stale and not ended:
+            return None
+        if liveness == "ended_90015":
+            reason = "auto-recovered: telnyx 90015 call already ended"
+        elif ended:
+            reason = "auto-recovered: telnyx call already ended"
+        elif force:
+            reason = "auto-recovered: manual reset"
+        else:
+            reason = f"auto-recovered: stale {status}"
+        new_status = "completed" if ended else _end_status(status)
+        ccid = str(row.get("telnyx_call_control_id") or "")
+        return new_status, reason, bool(ccid) and not ended
+
+    async def reconcile(self, *, force: bool = False, call_id: str | None = None) -> dict[str, Any]:
+        """Finish non-terminal jobs that are stale or that Telnyx already ended.
+
+        `force` ignores age (manual reset). Rows are updated, never deleted.
+        Runs once at process start and on the reaper interval with `force` false.
+        """
+        if call_id:
+            job = self.store.get(call_id)
+            if job is None:
+                raise StellaError(f"Unknown call id: {call_id}", "not_found")
+            if job.status in TERMINAL_STATUSES:
+                return {
+                    "count": 0,
+                    "reset": [],
+                    "call": {"id": job.id, "status": job.status},
+                }
+        now = datetime.now(timezone.utc)
+        reset: list[dict[str, Any]] = []
+        for row in self.store.list_by_status(NON_TERMINAL_STATUSES):
+            if call_id and row["id"] != call_id:
+                continue
+            liveness = "none"
+            ccid = row.get("telnyx_call_control_id") or ""
+            if ccid:
+                liveness = await asyncio.to_thread(self.telnyx.call_liveness, ccid)
+            plan = self.plan_recovery(row, now=now, force=force, liveness=liveness)
+            if plan is None:
+                continue
+            new_status, reason, do_hangup = plan
+            await call_sessions.close_session(row["id"])
+            item = self.recover_job(
+                row["id"],
+                status=new_status,
+                reason=reason,
+                hangup=do_hangup,
+            )
+            if item:
+                reset.append(item)
+        return {"count": len(reset), "reset": reset}
+
+    async def reset_stuck(self, call_id: str | None = None) -> dict[str, Any]:
+        """Finish stuck calls now. `call_id` limits it to one job; empty means every open job."""
+        return await self.reconcile(force=True, call_id=call_id)
+
+    def recover_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        reason: str,
+        hangup: bool,
+    ) -> dict[str, Any] | None:
+        job = self.store.get(job_id)
+        if job is None or job.status in TERMINAL_STATUSES:
+            return None
+        if hangup and job.telnyx_call_control_id:
+            self.hangup(job)
+        before = job.status
+        updated = self.finish_call(job_id, status=status, outcome=reason)
+        if (
+            updated is None
+            or updated.status not in TERMINAL_STATUSES
+            or reason not in (updated.outcome or "")
+        ):
+            return None
+        logger.warning(
+            "stella_reaper auto-recovered job=%s from=%s to=%s reason=%s",
+            job_id,
+            before,
+            updated.status,
+            reason,
+        )
+        try:
+            self.store.add_event(
+                job_id,
+                "stella.auto_recovered",
+                {"from_status": before, "status": updated.status, "reason": reason},
+            )
+        except Exception:
+            logger.exception("stella_reaper event write failed job=%s", job_id)
+        self._schedule_post_call_memory(job_id)
+        return {
+            "id": updated.id,
+            "status": updated.status,
+            "from_status": before,
+            "outcome": updated.outcome,
+        }
 
     def _maybe_callback(self, job: CallJob) -> None:
         url = (self.settings.stella_callback_url or "").strip()
@@ -430,6 +650,46 @@ class JobService:
             httpx.post(url, json=job.to_public_dict(), timeout=10.0)
         except Exception:
             logger.exception("STELLA_CALLBACK_URL post failed")
+
+
+def _webhook_status_allowed(current: str, new: str) -> bool:
+    """Webhooks may finish a call. They may not reopen one that already ended."""
+    if current not in TERMINAL_STATUSES:
+        return True
+    return current == "failed" and new == "completed"
+
+
+def _end_status(status: str) -> str:
+    """Terminal status for a leg we are closing ourselves (Telnyx did not already end it)."""
+    if status in {"queued", "dialing", "initiated"}:
+        return "failed"
+    if status == "rejecting":
+        return "rejected"
+    return "completed"
+
+
+def _merge_outcome(existing: str, extra: str) -> str:
+    extra = (extra or "").strip()
+    current = (existing or "").strip()
+    if not extra:
+        return current
+    if not current:
+        return extra[:2000]
+    if extra in current:
+        return current[:2000]
+    return f"{current} ({extra})"[:2000]
+
+
+def _row_age_s(row: dict[str, Any], now: datetime) -> float:
+    raw = str(row.get("updated_at") or row.get("created_at") or "")
+    try:
+        text = raw.replace("Z", "+00:00")
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return float("inf")
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - stamp).total_seconds())
 
 
 def base64_json(obj: dict[str, Any]) -> str:

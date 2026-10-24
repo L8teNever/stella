@@ -17,6 +17,7 @@ def build_mcp(service: JobService) -> FastMCP:
             "PSTN to TELNYX_FROM_NUMBER (owner by default). Use stella_call for "
             "outbound; inbound needs no MCP. stella_busy is a cheap read-only poll "
             "for whether a call is already in progress; it does not dial or wait. "
+            "stella_reset_stuck finishes jobs left non-terminal after a missed hangup. "
             "Pass everything the agent needs in "
             "brief/context. Stella has no direct access to Ida memory or other MCPs; only calls"
             " with the owner on the line may use the live `frag_ida` lookup."
@@ -69,11 +70,24 @@ def build_mcp(service: JobService) -> FastMCP:
     def stella_busy() -> dict[str, Any]:
         """Read-only: is Stella on a call right now? Safe to poll often. Does not dial or wait.
 
-        `busy` is true while any inbound or outbound job is queued, dialing, ringing
-        (`initiated`), in progress, completing, or rejecting. Returns `count` and
-        `calls` (id, direction, status, started_at, to, from). No brief or transcript.
+        `busy` is true only while a Telnyx leg is actually up: queued, dialing,
+        ringing (`initiated`), in progress, or rejecting. `completing` is post-hangup
+        bookkeeping and does not block a new call. Returns `count` and `calls`
+        (id, direction, status, started_at, to, from). No brief or transcript.
         """
         return service.busy()
+
+    @mcp.tool()
+    async def stella_reset_stuck(call_id: str = "") -> dict[str, Any]:
+        """Finish stuck calls immediately. Does not delete rows or place a call.
+
+        Pass `call_id` to finish one job, or omit it to finish every non-terminal job.
+        Hangs up a Telnyx leg that is still up. The outcome contains `auto-recovered:`.
+        """
+        try:
+            return await service.reset_stuck((call_id or "").strip() or None)
+        except StellaError as exc:
+            return exc.to_dict()
 
     @mcp.tool()
     def stella_recent_calls(limit: int = 10, kind: str = "") -> dict[str, Any]:

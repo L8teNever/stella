@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from stella import __version__, callback_bg, master_prompt, post_call_memory
+from stella import __version__, call_sessions, callback_bg, master_prompt, post_call_memory
 from stella.config import Settings, get_settings
 from stella.errors import StellaError
 from stella.jobs import BERLIN, JobService
@@ -34,11 +34,11 @@ def _token_ok(request: Request, expected: str) -> bool:
         return False
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, telnyx: TelnyxClient | None = None) -> FastAPI:
     settings = settings or get_settings()
     settings.data_dir()
     store = JobStore(settings.stella_db_path)
-    telnyx = TelnyxClient(settings)
+    telnyx = telnyx or TelnyxClient(settings)
     jobs = JobService(settings, store, telnyx)
     mcp = build_mcp(jobs)
     mcp_asgi = mcp.streamable_http_app()
@@ -52,11 +52,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await master_prompt.refresh(settings)
                 await asyncio.sleep(max(10.0, settings.master_prompt_refresh_s))
 
+        async def reaper_loop() -> None:
+            interval = max(5.0, float(settings.stella_reaper_interval_s or 60.0))
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await jobs.reconcile()
+                except Exception:
+                    logger.exception("stella_reaper pass failed")
+
         mp_task = asyncio.create_task(master_prompt_loop())
+        try:
+            await jobs.reconcile()
+        except Exception:
+            logger.exception("stella_reaper startup reconcile failed")
+        reaper_task = asyncio.create_task(reaper_loop())
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
+            reaper_task.cancel()
             mp_task.cancel()
 
     app = FastAPI(title="Stella", version=__version__, lifespan=lifespan)
@@ -127,6 +142,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data["events"] = store.events(job.id)
         return data
 
+    @app.post("/calls/reset-stuck")
+    async def reset_stuck(request: Request):
+        """Finish non-terminal calls now. Same token as `/calls` and `/mcp`."""
+        call_id = ""
+        raw = await request.body()
+        if raw:
+            try:
+                body = json.loads(raw)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+            if isinstance(body, dict):
+                call_id = str(body.get("call_id") or "")
+        try:
+            return await jobs.reset_stuck(call_id.strip() or None)
+        except StellaError as exc:
+            status = 404 if exc.code == "not_found" else 400
+            raise HTTPException(status_code=status, detail=exc.message) from exc
+
     @app.websocket("/media/{job_id}")
     async def media(websocket: WebSocket, job_id: str):
         await websocket.accept()
@@ -139,12 +172,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.append_transcript(job_id, chunk)
 
         def outcome_cb(text: str) -> None:
-            store.update(job_id, outcome=text, status="completing")
+            # `completing` only while the leg is still winding down. A terminal
+            # status (our hangup, media close, webhook, reaper) is never demoted.
+            jobs.note_outcome(job_id, text)
 
         async def hangup_cb() -> None:
             current = store.get(job_id)
             if current:
-                jobs.hangup(current)
+                # Successful hangup — including Telnyx 90015 — completes the job
+                # here. call.hangup is not required.
+                jobs.hangup_own_leg(current)
+
+        async def close_media() -> None:
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass
 
         async def ws_connect(url: str, headers: dict):
             import websockets
@@ -158,26 +201,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             run_at = plan["run_at"].astimezone(BERLIN)
             return {"result": f"Eingeplant für {run_at:%H:%M} Uhr."}
 
+        failed = False
+        err = ""
+        call_sessions.register(job_id, close_media)
         try:
             post_call_memory.note_media_open(job_id)
-            await start_voice_bridge(
-                settings=settings,
-                job=job,
-                telnyx_ws=websocket,
-                ws_connect=ws_connect,
-                hangup_cb=hangup_cb,
-                transcript_cb=transcript_cb,
-                outcome_cb=outcome_cb,
-                schedule_cb=schedule_cb,
-            )
-        except WebSocketDisconnect:
-            pass
-        except Exception as exc:
-            logger.exception("media session failed for %s", job_id)
-            store.update(job_id, status="failed", error=str(exc)[:2000] or "voice session failed")
+            try:
+                await start_voice_bridge(
+                    settings=settings,
+                    job=job,
+                    telnyx_ws=websocket,
+                    ws_connect=ws_connect,
+                    hangup_cb=hangup_cb,
+                    transcript_cb=transcript_cb,
+                    outcome_cb=outcome_cb,
+                    schedule_cb=schedule_cb,
+                )
+            except WebSocketDisconnect:
+                pass
+            except Exception as exc:
+                failed = True
+                err = str(exc)[:2000] or "voice session failed"
+                logger.exception("media session failed for %s", job_id)
         finally:
+            # Status first, then the detached memory hook. Every exit — hangup,
+            # remote close, exception, Gemini failure — lands in a terminal status
+            # even when the Telnyx call.hangup webhook never arrives.
             post_call_memory.note_media_closed(job_id)
-            post_call_memory.start(settings, store, job_id, wait_for_media=False)
+            call_sessions.unregister(job_id)
+            try:
+                jobs.finalize_session(job_id, failed=failed, error=err)
+            except Exception:
+                logger.exception("finalize_session failed for %s", job_id)
+                try:
+                    current = store.get(job_id)
+                    if current and current.status not in {"completed", "failed", "rejected"}:
+                        store.update(
+                            job_id,
+                            status="failed",
+                            error=err or "voice session failed",
+                        )
+                except Exception:
+                    logger.exception("terminal status fallback failed for %s", job_id)
 
     @app.middleware("http")
     async def normalize_mcp_case(request: Request, call_next):

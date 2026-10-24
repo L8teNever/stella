@@ -108,7 +108,7 @@ STELLA_MCP_TOOL_TIMEOUT_S=8
 
 ### Memory after the call
 
-When an **owner** call ends — Simon hangs up, Stella hangs up, or the leg fails or times out — Stella reads the stored transcript and writes durable facts into the Memory MCP server. The work is a background task started after the hangup status is saved. It does not delay the webhook response or the job status. Repeated hangup events for the same call run the write at most once.
+When an **owner** call ends — Simon hangs up, Stella hangs up, or the leg fails or times out — Stella reads the stored transcript and writes durable facts into the Memory MCP server. The job is already `completed` or `failed` before this starts. The work is a detached background task with a hard timeout (`STELLA_POST_CALL_MEMORY_TIMEOUT_S`, default 180s). It does not delay the webhook response, and a timeout or error is written only to `memory_summary`. Repeated hangup events for the same call run the write at most once.
 
 Stella asks Claude (`claude -p`, model `ASK_IDA_MODEL`) to return only lasting facts: new information about Simon, other people, appointments and commitments, preferences, decisions, tasks. Smalltalk, tests, and duplicates are dropped. An empty result writes nothing.
 
@@ -198,11 +198,19 @@ Or locally after `pip install -e .`: `stella mcp` / `stella-mcp`.
 
 **`stella_briefing_call`** — `to` + `text` to read aloud (morning briefing), then hang up.
 
-**`stella_busy`** — read-only, no arguments. Safe to poll often while other agents call `stella_call`. One indexed SQLite read of jobs that are still on the line (`queued`, `dialing`, `initiated` / ringing, `in_progress`, `completing`, `rejecting`), inbound or outbound. It does not dial, hang up, or load briefs and transcripts. A job stays busy until it reaches `completed`, `failed`, or `rejected`.
+**`stella_busy`** — read-only, no arguments. Safe to poll often while other agents call `stella_call`. One indexed SQLite read of jobs whose Telnyx leg is still up (`queued`, `dialing`, `initiated` / ringing, `in_progress`, `rejecting`), inbound or outbound. `completing` is post-hangup bookkeeping and does **not** count as busy. The check does not dial, hang up, or load briefs and transcripts.
 
 ```json
 {"busy": false, "count": 0, "calls": []}
 ```
+
+**`stella_reset_stuck`** — finish non-terminal jobs immediately (`call_id` optional; omit it to finish every open job). Does not delete rows. Hangs up a Telnyx leg that is still up and sets `outcome` to a reason starting with `auto-recovered:`. The same action is `POST /calls/reset-stuck` (optional JSON `{"call_id": "..."}`), with the same bearer token as `/mcp` and `/calls`.
+
+### Stuck calls
+
+A missed `call.hangup` webhook used to leave the job on `completing` forever, and `stella_busy` then blocked every new call. Stella now marks the job `completed` (or `failed`) itself when **its own hangup succeeds** (Telnyx error **90015** counts as already ended) and again when the **media WebSocket closes**, whether that close is clean, a disconnect, or an exception. `outcome_cb` never moves a terminal status back to `completing`.
+
+A reaper runs at process start and then every `STELLA_REAPER_INTERVAL_S` (default 60). It finishes a non-terminal job when Telnyx reports the leg ended (`90015` or `is_alive: false`) or when the job is older than `STELLA_STALE_CALL_S` (default 900, active legs) or `STELLA_STALE_COMPLETING_S` (default 180, `completing`). It hangs up a leg that is still up, closes an in-process media session, and logs `stella_reaper auto-recovered`. Rows are updated, not deleted.
 
 When Stella is in use, `calls` is a short list: `id`, `direction` (`inbound` or `outbound`), `status`, `started_at`, `to`, `from`.
 

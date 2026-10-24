@@ -1,8 +1,9 @@
 """Write durable facts from an owner call into the Memory MCP server.
 
-Runs after the call has already ended. The Telnyx hangup and the job status
-update never wait for it. A job is claimed once in SQLite, so repeated hangup
-events do not extract or write twice.
+The job is already in a terminal status before this starts. The task is
+detached and capped by STELLA_POST_CALL_MEMORY_TIMEOUT_S; a timeout or any
+other error is written only to memory_summary. A job is claimed once in
+SQLite, so repeated hangup events do not extract or write twice.
 """
 
 from __future__ import annotations
@@ -432,6 +433,50 @@ async def run(
             logger.exception("stella_memory status update failed job=%s", job_id)
 
 
+def _note_memory_timeout(store: JobStore, job_id: str) -> None:
+    """Record a hard timeout. Does not touch call status."""
+    current = store.get(job_id)
+    if current is None or current.memory_summary:
+        return
+    if not current.memory_done and not store.claim_memory(job_id):
+        current = store.get(job_id)
+        if current is None or current.memory_summary:
+            return
+    _finish(store, job_id, f"Fehler: {ask_ida_mod.MSG_TIMEOUT}", [])
+
+
+async def _run_bounded(
+    settings: Settings,
+    store: JobStore,
+    job_id: str,
+    *,
+    wait_for_media: bool,
+    max_wait_s: float,
+) -> None:
+    timeout = float(settings.stella_post_call_memory_timeout_s or 180.0)
+    if timeout <= 0:
+        timeout = 180.0
+    try:
+        await asyncio.wait_for(
+            run(
+                settings,
+                store,
+                job_id,
+                wait_for_media=wait_for_media,
+                max_wait_s=max_wait_s,
+            ),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        logger.warning("stella_memory timeout job=%s", job_id)
+        try:
+            _note_memory_timeout(store, job_id)
+        except Exception:
+            logger.exception("stella_memory timeout update failed job=%s", job_id)
+    except asyncio.CancelledError:
+        raise
+
+
 def start(
     settings: Settings,
     store: JobStore,
@@ -440,13 +485,17 @@ def start(
     wait_for_media: bool = False,
     max_wait_s: float = MEDIA_WAIT_S,
 ) -> asyncio.Task | None:
-    """Schedule the memory pass. Returns None when no event loop is running."""
+    """Schedule the memory pass. Returns None when no event loop is running.
+
+    The task does not block the caller and cannot move the job out of a
+    terminal status. A hard timeout writes the error into memory_summary only.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
     task = loop.create_task(
-        run(
+        _run_bounded(
             settings,
             store,
             job_id,

@@ -255,7 +255,8 @@ class JobStore:
             return []
         placeholders = ",".join("?" for _ in keys)
         sql = (
-            "SELECT id, kind, status, to_number, created_at FROM jobs "
+            "SELECT id, kind, status, to_number, created_at, updated_at, "
+            "telnyx_call_control_id FROM jobs "
             f"WHERE status IN ({placeholders}) ORDER BY created_at ASC, id ASC"
         )
         with self._lock:
@@ -272,6 +273,10 @@ class JobStore:
                 "status": row["status"],
                 "to_number": row["to_number"],
                 "created_at": row["created_at"],
+                "updated_at": row["updated_at"] if "updated_at" in row.keys() else row["created_at"],
+                "telnyx_call_control_id": (
+                    row["telnyx_call_control_id"] if "telnyx_call_control_id" in row.keys() else ""
+                ),
             }
             for row in rows
         ]
@@ -305,6 +310,96 @@ class JobStore:
         values = list(fields.values()) + [job_id]
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", values)
+            conn.commit()
+        return self.get(job_id)
+
+    def update_unless(
+        self,
+        job_id: str,
+        *,
+        unless_status: Collection[str],
+        **fields: Any,
+    ) -> tuple[CallJob | None, bool]:
+        """Apply `fields` only while the current status is outside `unless_status`.
+
+        Holds the store lock across the write so a terminal status cannot be
+        overwritten by a late outcome or webhook. Returns (job, changed).
+        """
+        if not fields:
+            return self.get(job_id), False
+        fields["updated_at"] = _now()
+        blocked = tuple(dict.fromkeys(unless_status))
+        if not blocked:
+            updated = self.update(job_id, **{k: v for k, v in fields.items() if k != "updated_at"})
+            return updated, updated is not None
+        placeholders = ",".join("?" for _ in blocked)
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        values = [*fields.values(), job_id, *blocked]
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE jobs SET {cols} WHERE id = ? AND status NOT IN ({placeholders})",
+                values,
+            )
+            conn.commit()
+            changed = cur.rowcount == 1
+        return self.get(job_id), changed
+
+    def update_call_status(self, job_id: str, status: str) -> tuple[CallJob | None, bool]:
+        """Set status unless that would pull a finished job back onto the line.
+
+        `failed` may still become `completed` when the hangup webhook arrives
+        after a streaming failure. `completed` and `rejected` stay put.
+        """
+        now = _now()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs SET status = ?, updated_at = ?
+                WHERE id = ? AND (
+                    status NOT IN ('completed', 'failed', 'rejected')
+                    OR (status = 'failed' AND ? = 'completed')
+                )
+                """,
+                (status, now, job_id, status),
+            )
+            conn.commit()
+            changed = cur.rowcount == 1
+        return self.get(job_id), changed
+
+    def note_outcome(
+        self,
+        job_id: str,
+        text: str,
+        *,
+        terminal_statuses: Collection[str],
+    ) -> CallJob | None:
+        """Record the spoken outcome. A terminal status is never moved back to completing."""
+        text = (text or "")[:2000]
+        terminal = tuple(dict.fromkeys(terminal_statuses))
+        if not terminal:
+            return self.get(job_id)
+        placeholders = ",".join("?" for _ in terminal)
+        now = _now()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, outcome FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] in terminal:
+                if text and not row["outcome"]:
+                    conn.execute(
+                        "UPDATE jobs SET outcome = ?, updated_at = ? "
+                        f"WHERE id = ? AND status IN ({placeholders}) AND outcome = ''",
+                        (text, now, job_id, *terminal),
+                    )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET outcome = ?, status = 'completing', updated_at = ? "
+                    f"WHERE id = ? AND status NOT IN ({placeholders})",
+                    (text, now, job_id, *terminal),
+                )
             conn.commit()
         return self.get(job_id)
 

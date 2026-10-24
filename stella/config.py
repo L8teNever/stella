@@ -119,6 +119,17 @@ class Settings(BaseSettings):
     # them to the MCP server named here (an entry in STELLA_MCP_SERVERS).
     stella_post_call_memory: bool = True
     stella_post_call_memory_server: str = "memory"
+    # Hard ceiling for the detached post-hangup memory task. The call status
+    # is already terminal before this runs; on timeout only memory_summary is set.
+    stella_post_call_memory_timeout_s: float = 180.0
+    # Reaper: non-terminal jobs older than this are finished without deleting them.
+    # Active Telnyx legs (queued/dialing/ringing/in_progress/rejecting) use
+    # stella_stale_call_s. `completing` is post-hangup bookkeeping and uses
+    # the shorter stella_stale_completing_s. A Telnyx 90015 (call already
+    # ended) is recovered on the next pass regardless of age.
+    stella_stale_call_s: float = 900.0
+    stella_stale_completing_s: float = 180.0
+    stella_reaper_interval_s: float = 60.0
     # Auth for Claude Code (either one); IDA_MCP_TOKEN fills ${IDA_MCP_TOKEN} in the MCP file.
     anthropic_api_key: str = ""
     claude_code_oauth_token: str = ""

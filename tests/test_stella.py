@@ -298,6 +298,7 @@ def test_mcp_tools_registered(tmp_path):
         "stella_briefing_call",
         "stella_recent_calls",
         "stella_busy",
+        "stella_reset_stuck",
     }
 
 
@@ -1781,13 +1782,19 @@ def test_stella_busy_snapshot_is_readonly(tmp_path):
     assert tool.fn() == snap
     assert transport.calls == []
 
-    for status in ("initiated", "completing", "rejecting", "in_progress"):
+    for status in ("initiated", "rejecting", "in_progress"):
         store.update(outbound.id, status=status)
         again = svc.busy()
         assert again["count"] == 3
         assert any(c["id"] == outbound.id and c["status"] == status for c in again["calls"])
+    # Post-hangup bookkeeping must not block the line. The leg is already going down.
+    store.update(outbound.id, status="completing")
+    winding_down = svc.busy()
+    assert winding_down["count"] == 2
+    assert all(c["id"] != outbound.id for c in winding_down["calls"])
+    store.update(outbound.id, status="in_progress")
     assert BUSY_STATUSES == {
-        "queued", "dialing", "initiated", "in_progress", "completing", "rejecting",
+        "queued", "dialing", "initiated", "in_progress", "rejecting",
     }
 
     from fastapi.testclient import TestClient

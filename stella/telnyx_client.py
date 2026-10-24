@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 import httpx
@@ -9,6 +10,11 @@ import httpx
 from stella.audio_pcmu import CODEC_PCMU, preferred_telnyx_codec
 from stella.config import Settings
 from stella.errors import StellaError
+
+logger = logging.getLogger(__name__)
+
+# Telnyx: the leg is already gone. Hangup and retrieve both surface this.
+CALL_ALREADY_ENDED = "90015"
 
 
 class TelnyxTransport(Protocol):
@@ -157,6 +163,11 @@ class TelnyxClient:
             headers=self._headers(),
             json={},
         )
+        if CALL_ALREADY_ENDED in response_error_codes(resp):
+            raise StellaError(
+                "Telnyx hangup: call already ended (90015)",
+                "telnyx_call_ended",
+            )
         return self._parse(resp, "hangup")
 
     def speak(self, call_control_id: str, text: str, *, language: str = "en-US") -> dict[str, Any]:
@@ -177,3 +188,65 @@ class TelnyxClient:
             headers=self._headers(),
         )
         return self._parse(resp, "retrieve")
+
+    def call_liveness(self, call_control_id: str) -> str:
+        """Whether Telnyx still has this leg.
+
+        Returns `ended_90015` (error 90015), `ended` (`is_alive` false or a
+        terminal call state), `alive`, or `unknown` when the API cannot be read.
+        Never raises: the reaper treats `unknown` as "decide from age only".
+        """
+        if not (call_control_id or "").strip():
+            return "unknown"
+        try:
+            self._require_config()
+        except StellaError:
+            return "unknown"
+        try:
+            resp = self._http.request(
+                "GET",
+                self._url(f"/calls/{call_control_id}"),
+                headers=self._headers(),
+                timeout=5.0,
+            )
+        except Exception:
+            logger.warning("telnyx retrieve failed for %s", call_control_id, exc_info=True)
+            return "unknown"
+        if CALL_ALREADY_ENDED in response_error_codes(resp):
+            return "ended_90015"
+        if resp.status_code >= 400:
+            return "unknown"
+        try:
+            data = resp.json()
+        except ValueError:
+            return "unknown"
+        inner = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(inner, dict):
+            inner = data if isinstance(data, dict) else {}
+        if inner.get("is_alive") is False:
+            return "ended"
+        state = str(inner.get("state") or inner.get("status") or "").strip().lower()
+        if state in {"hangup", "ended", "destroyed", "completed"}:
+            return "ended"
+        if inner.get("is_alive") is True or inner.get("call_control_id"):
+            return "alive"
+        return "unknown"
+
+
+def response_error_codes(resp: httpx.Response) -> set[str]:
+    """Telnyx `errors[].code` values. 90015 is also accepted from a non-JSON body."""
+    codes: set[str] = set()
+    body: Any = None
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            for err in errors:
+                if isinstance(err, dict) and err.get("code") is not None:
+                    codes.add(str(err["code"]))
+    if not codes and CALL_ALREADY_ENDED in (getattr(resp, "text", None) or ""):
+        codes.add(CALL_ALREADY_ENDED)
+    return codes
